@@ -1,0 +1,12 @@
+{
+  "name": "rdc-web-build-backend",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Managed website lifecycle backend for RDC Website Studio.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/index.mjs && node --check src/contracts/lifecycle.mjs && node --check test/lifecycle.test.mjs"
+  }
+}
