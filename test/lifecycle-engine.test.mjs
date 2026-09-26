@@ -33,6 +33,9 @@ function createWorkspaceAuthority() {
     computeDigest(projectId) {
       return current.get(projectId);
     },
+    listFiles() {
+      return [{ path: "index.html", size: 1 }];
+    },
     captureAcceptedBaseline(projectId) {
       const digest = current.get(projectId);
       const snapshot_id = `snapshot-${++snapshotCounter}`;

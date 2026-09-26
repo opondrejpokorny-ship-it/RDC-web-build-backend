@@ -7,7 +7,7 @@
   "engines": { "node": ">=22" },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/index.mjs && node --check src/contracts/lifecycle.mjs && node --check src/contracts/authorization.mjs && node --check src/lifecycle/json-store.mjs && node --check src/lifecycle/service.mjs && node --check scripts/public-safety.mjs && node --check scripts/public-provenance.mjs && node --check test/lifecycle.test.mjs && node --check test/lifecycle-engine.test.mjs && node --check test-support/store-first-use-worker.mjs && node --check test-support/store-lock-crash-worker.mjs && node --check test/public-safety.test.mjs && node --check test/public-provenance.test.mjs",
+    "check": "node --check src/index.mjs && node --check src/contracts/lifecycle.mjs && node --check src/contracts/authorization.mjs && node --check src/lifecycle/json-store.mjs && node --check src/lifecycle/service.mjs && node --check src/workspace/static-workspace.mjs && node --check src/validation/static-validation.mjs && node --check src/preview/static-preview.mjs && node --check scripts/public-safety.mjs && node --check scripts/public-provenance.mjs && node --check test/lifecycle.test.mjs && node --check test/lifecycle-engine.test.mjs && node --check test/static-workspace-preview.test.mjs && node --check test-support/store-first-use-worker.mjs && node --check test-support/store-lock-crash-worker.mjs && node --check test/public-safety.test.mjs && node --check test/public-provenance.test.mjs",
     "public-safety": "node scripts/public-safety.mjs",
     "provenance-check": "node scripts/public-provenance.mjs --check"
   }
