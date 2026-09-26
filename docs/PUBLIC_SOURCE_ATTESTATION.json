@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "scope": "public_repository_tree",
+  "review_status": "semantic_provenance_reviewed",
+  "source_mode": "clean_room",
+  "private_source_copied": false,
+  "third_party_source_copied": false,
+  "reuse_requires_explicit_rights": true,
+  "review_evidence_id": "rdc-website-studio-static-web-bootstrap-2026-09-26",
+  "review_methods": [
+    "semantic_diff_review",
+    "codex_terra_p0_p1_review",
+    "public_safety_scan"
+  ],
+  "tree_sha256": "sha256:543712a2c527dffcfe85ab70e3a9a9789ead4ade75fe62ec17f5283f99a2a332",
+  "file_count": 26
+}
