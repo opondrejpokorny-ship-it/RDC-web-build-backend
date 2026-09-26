@@ -1,5 +1,5 @@
 # Review / Preview Panel
 
-Retain and adapt the Codebase human review surface rather than rebuilding it blindly.
+Future home of the human review surface for managed website projects.
 
-The panel must keep Development Preview separate from Published Preview and expose Reject, Accept, and explicitly authorized publish flows.
+The panel must keep Development Preview separate from Published Preview and expose exact Reject, Accept, Release Prepare and Release Activate flows without becoming the security authority itself.

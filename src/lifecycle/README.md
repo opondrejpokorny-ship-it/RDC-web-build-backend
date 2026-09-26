@@ -1,5 +1,9 @@
 # Lifecycle module
 
-Future home of project state, change transactions, snapshot/history, validation and accepted-state orchestration.
+This module contains the independently written local `static_web` lifecycle engine.
 
-Reuse should preserve exact reviewed-state identity and reject/restore behavior. Direct RDC writes must not bypass the managed lifecycle.
+`JsonLifecycleStore` persists project state, consumed authorization IDs, idempotency results and pending external-operation intent in one JSON authority file using an exclusive lock acquired before first initialization/read-for-mutation and atomic file replacement.
+
+`StaticLifecycleService` owns exact state transitions and re-reads the authoritative workspace digest through an injected workspace authority before every new human-gated mutation. Accept captures an accepted baseline; Reject restores that baseline and preserves the separately tracked active release. Release Prepare and Release Activate first persist an exact pending intent and consume the bound authorization, then call separate release-authority methods. Retries with the same exact request recover through `getPreparedRelease` / `getActivation`; providers must key their side effects by the supplied idempotency key.
+
+The current engine is intentionally single-machine and fail-closed. The lock is an atomically created directory containing an owner-specific metadata file with PID, hostname, owner nonce, process-start identity and creation time. A dead same-host owner is recoverable immediately. Age alone never evicts a verified live owner; after the stale threshold, process-start identity distinguishes a genuinely reused PID from the original process. Recovery deletes only the exact stale owner file and then removes the directory only if it is empty, while release likewise removes only its own owner nonce. If process identity cannot be verified, the store fails closed rather than stealing a live lock. Real workspace and release providers still require production-grade durability/availability design; the current JSON authority is not a distributed control plane. Direct RDC writes must not bypass the managed lifecycle.
