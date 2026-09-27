@@ -184,7 +184,12 @@ export class StaticLifecycleService {
     if (!store || typeof store.read !== "function" || typeof store.transact !== "function") {
       throw new TypeError("store_authority_required");
     }
-    for (const method of ["computeDigest", "captureAcceptedBaseline", "restoreAcceptedBaseline"]) {
+    for (const method of [
+      "computeDigest",
+      "captureReadView",
+      "captureAcceptedBaseline",
+      "restoreAcceptedBaseline",
+    ]) {
       if (typeof workspaceAuthority?.[method] !== "function") {
         throw new TypeError(`workspace_authority_${method}_required`);
       }

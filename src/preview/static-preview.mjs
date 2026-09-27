@@ -49,16 +49,30 @@ function routePath(raw, prefix) {
   return normalized;
 }
 
-export async function startStaticDevelopmentPreview({ workspace, project_id, expected_workspace_digest }) {
-  const validation = validateStaticWorkspace({ workspace, project_id, expected_workspace_digest });
+export async function startStaticDevelopmentPreview({
+  workspace,
+  project_id,
+  expected_workspace_digest,
+  read_view = null,
+}) {
+  const view = read_view ?? workspace.captureReadView(project_id, {
+    expected_workspace_digest,
+  });
+  const validation = validateStaticWorkspace({
+    workspace,
+    project_id,
+    expected_workspace_digest,
+    read_view: view,
+  });
   if (!validation.ok) throw new Error("static_validation_failed");
 
   const files = new Map();
-  for (const entry of workspace.listFiles(project_id)) {
-    files.set(entry.path, Buffer.from(workspace.readFile(project_id, entry.path)));
+  for (const entry of view.listFiles()) {
+    files.set(entry.path, view.readFile(entry.path));
   }
-  if (workspace.computeDigest(project_id) !== expected_workspace_digest) throw new Error("workspace_digest_mismatch");
-  if (digestCapturedFiles(files) !== expected_workspace_digest) throw new Error("preview_snapshot_digest_mismatch");
+  if (digestCapturedFiles(files) !== expected_workspace_digest) {
+    throw new Error("preview_snapshot_digest_mismatch");
+  }
 
   const token = crypto.randomBytes(32).toString("hex");
   const preview_id = "preview-" + crypto.randomBytes(16).toString("hex");

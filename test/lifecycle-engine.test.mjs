@@ -36,6 +36,29 @@ function createWorkspaceAuthority() {
     listFiles() {
       return [{ path: "index.html", size: 1 }];
     },
+    captureReadView(projectId, { expected_workspace_digest } = {}) {
+      const digest = current.get(projectId);
+      if (expected_workspace_digest !== undefined && digest !== expected_workspace_digest) {
+        const error = new Error("workspace_digest_mismatch");
+        error.code = "workspace_digest_mismatch";
+        throw error;
+      }
+      return Object.freeze({
+        project_id: projectId,
+        workspace_digest: digest,
+        listFiles() {
+          return Object.freeze([Object.freeze({ path: "index.html", size: 1 })]);
+        },
+        readFile(relativePath) {
+          if (relativePath !== "index.html") {
+            const error = new Error("workspace_file_not_found");
+            error.code = "workspace_file_not_found";
+            throw error;
+          }
+          return Buffer.from("x");
+        },
+      });
+    },
     captureAcceptedBaseline(projectId) {
       const digest = current.get(projectId);
       const snapshot_id = `snapshot-${++snapshotCounter}`;
