@@ -1274,10 +1274,20 @@ test("preview rejects captured bytes that do not match the reviewed digest", asy
     const workspace = new StaticWorkspaceAuthority(tmp.dir);
     workspace.initializeProject("site-1", { "index.html": "<h1>REVIEWED</h1>" });
     const digest = workspace.computeDigest("site-1");
-    const originalRead = workspace.readFile.bind(workspace);
-    workspace.readFile = (projectId, relativePath) => (
-      relativePath === "index.html" ? Buffer.from("<h1>UNREVIEWED-RACE</h1>") : originalRead(projectId, relativePath)
-    );
+    const originalCapture = workspace.captureReadView.bind(workspace);
+    workspace.captureReadView = (projectId, options) => {
+      const view = originalCapture(projectId, options);
+      return Object.freeze({
+        project_id: view.project_id,
+        workspace_digest: view.workspace_digest,
+        listFiles: () => view.listFiles(),
+        readFile(relativePath) {
+          return relativePath === "index.html"
+            ? Buffer.from("<h1>UNREVIEWED-RACE</h1>")
+            : view.readFile(relativePath);
+        },
+      });
+    };
 
     await assert.rejects(
       startStaticDevelopmentPreview({
@@ -1339,6 +1349,119 @@ test("preview serves immutable verified snapshot bytes across a digest-check mut
     assert.equal(stale.headers["cache-control"], "no-store");
   } finally {
     if (preview) await preview.close();
+    tmp.cleanup();
+  }
+});
+
+test("immutable read view captures exact bounded bytes and returns defensive copies", () => {
+  const tmp = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(path.join(tmp.dir, "workspace"));
+    workspace.initializeProject("site-1", {
+      "index.html": "<h1>stable</h1>",
+      "assets/site.css": "body{}",
+    });
+    const digest = workspace.computeDigest("site-1");
+
+    const view = workspace.captureReadView("site-1", {
+      expected_workspace_digest: digest,
+    });
+    assert.equal(view.workspace_digest, digest);
+    assert.deepEqual(view.listFiles(), [
+      { path: "assets/site.css", size: 6 },
+      { path: "index.html", size: 15 },
+    ]);
+    const first = view.readFile("index.html");
+    first.fill(0);
+    assert.equal(view.readFile("index.html").toString("utf8"), "<h1>stable</h1>");
+    assert.throws(() => view.readFile("../secret"), /workspace_path_invalid|workspace_file_not_found/);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("immutable read view rejects A-B-A substitution during capture", () => {
+  const tmp = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(path.join(tmp.dir, "workspace"));
+    workspace.initializeProject("site-1", { "index.html": "AAAA" });
+    const digest = workspace.computeDigest("site-1");
+    const target = path.join(workspace.getWorkingDirectory("site-1"), "index.html");
+    const originalRead = workspace._readFileForCapture.bind(workspace);
+    let injected = false;
+    workspace._readFileForCapture = (projectId, relativePath) => {
+      if (!injected && relativePath === "index.html") {
+        injected = true;
+        fs.writeFileSync(target, "BBBB");
+        const bytes = originalRead(projectId, relativePath);
+        fs.writeFileSync(target, "AAAA");
+        return bytes;
+      }
+      return originalRead(projectId, relativePath);
+    };
+
+    assert.throws(
+      () => workspace.captureReadView("site-1", { expected_workspace_digest: digest }),
+      /workspace_(?:digest|read_view)_mismatch/,
+    );
+    assert.equal(workspace.computeDigest("site-1"), digest);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("immutable read view holds the authoritative mutation lock for the whole capture", () => {
+  const tmp = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(path.join(tmp.dir, "workspace"));
+    workspace.initializeProject("site-1", { "index.html": "stable" });
+    const digest = workspace.computeDigest("site-1");
+    const projectRoot = workspace.projectRoot("site-1");
+    const held = workspace._acquireWorkspaceLock(projectRoot);
+    try {
+      assert.throws(
+        () => workspace.captureReadView("site-1", {
+          expected_workspace_digest: digest,
+        }),
+        /workspace_busy/,
+      );
+    } finally {
+      workspace._releaseWorkspaceLock(held);
+    }
+
+    const view = workspace.captureReadView("site-1", {
+      expected_workspace_digest: digest,
+    });
+    assert.equal(view.workspace_digest, digest);
+    assert.equal(workspace.readFile("site-1", "index.html").toString("utf8"), "stable");
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("validation can consume one immutable read view without re-reading live workspace", () => {
+  const tmp = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(path.join(tmp.dir, "workspace"));
+    workspace.initializeProject("site-1", { "index.html": "<h1>ok</h1>" });
+    const digest = workspace.computeDigest("site-1");
+    const view = workspace.captureReadView("site-1", {
+      expected_workspace_digest: digest,
+    });
+
+    const guardedWorkspace = {
+      captureReadView() { return view; },
+      computeDigest() { throw new Error("live_digest_must_not_be_read"); },
+      listFiles() { throw new Error("live_manifest_must_not_be_read"); },
+    };
+    const result = validateStaticWorkspace({
+      workspace: guardedWorkspace,
+      project_id: "site-1",
+      expected_workspace_digest: digest,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.workspace_digest, digest);
+  } finally {
     tmp.cleanup();
   }
 });
