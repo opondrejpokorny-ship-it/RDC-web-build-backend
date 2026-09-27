@@ -208,11 +208,12 @@ function readRegularFileStable(root, relative) {
   }
 }
 
-function digestTree(root) {
+function digestCapturedEntries(entries) {
   const hash = crypto.createHash("sha256");
   hash.update(STATIC_WORKSPACE_DIGEST_VERSION + "\0", "utf8");
-  for (const rel of walkFiles(root)) {
-    const bytes = readRegularFileStable(root, rel);
+  for (const entry of entries) {
+    const rel = entry.path;
+    const bytes = entry.bytes;
     const name = Buffer.from(rel, "utf8");
     const frame = Buffer.alloc(16);
     frame.writeBigUInt64BE(BigInt(name.length), 0);
@@ -222,6 +223,16 @@ function digestTree(root) {
     hash.update(bytes);
   }
   return hash.digest("hex");
+}
+
+function* readTreeEntries(root) {
+  for (const rel of walkFiles(root)) {
+    yield { path: rel, bytes: readRegularFileStable(root, rel) };
+  }
+}
+
+function digestTree(root) {
+  return digestCapturedEntries(readTreeEntries(root));
 }
 
 function copyTreeVerified(source, destination, containmentRoot) {
@@ -754,6 +765,75 @@ export class StaticWorkspaceAuthority {
     });
   }
 
+  _readFileForCapture(projectId, relativePath) {
+    const rel = normalizeRelative(relativePath);
+    const working = this.getWorkingDirectory(projectId);
+    ensureNoLinks(working, rel);
+    return readRegularFileStable(working, rel);
+  }
+
+  captureReadView(projectId, { expected_workspace_digest } = {}) {
+    return this._withProjectMutationLock(projectId, () => {
+      const working = this.getWorkingDirectory(projectId);
+      if (!fs.existsSync(working)) fail("workspace_project_not_found");
+      ensurePathEntrySafe(working);
+
+      const paths = walkFiles(working);
+      if (paths.length > this.limits.max_files) fail("workspace_limit_files");
+
+      const captured = [];
+      let totalBytes = 0;
+      for (const rel of paths) {
+        const target = path.join(working, ...rel.split("/"));
+        ensureNoLinks(working, rel);
+        const stat = fs.lstatSync(target);
+        if (!stat.isFile()) fail("workspace_file_not_found");
+        if (stat.size > this.limits.max_file_bytes) fail("workspace_limit_file_bytes");
+
+        const bytes = Buffer.from(this._readFileForCapture(projectId, rel));
+        if (bytes.length > this.limits.max_file_bytes) fail("workspace_limit_file_bytes");
+        totalBytes += bytes.length;
+        if (totalBytes > this.limits.max_total_bytes) fail("workspace_limit_total_bytes");
+        captured.push(Object.freeze({ path: rel, bytes }));
+      }
+
+      const capturedDigest = digestCapturedEntries(captured);
+      if (
+        expected_workspace_digest !== undefined
+        && capturedDigest !== expected_workspace_digest
+      ) {
+        fail("workspace_digest_mismatch");
+      }
+
+      const liveDigest = digestTree(working);
+      if (liveDigest !== capturedDigest) fail("workspace_read_view_mismatch");
+
+      const manifest = Object.freeze(
+        captured.map(({ path: rel, bytes }) => Object.freeze({
+          path: rel,
+          size: bytes.length,
+        })),
+      );
+      const bytesByPath = new Map(
+        captured.map(({ path: rel, bytes }) => [rel, Buffer.from(bytes)]),
+      );
+
+      return Object.freeze({
+        project_id: projectId,
+        workspace_digest: capturedDigest,
+        listFiles() {
+          return manifest;
+        },
+        readFile(relativePath) {
+          const rel = normalizeRelative(relativePath);
+          const bytes = bytesByPath.get(rel);
+          if (!bytes) fail("workspace_file_not_found");
+          return Buffer.from(bytes);
+        },
+      });
+    });
+  }
+
   listFiles(projectId) {
     const working = this.getWorkingDirectory(projectId);
     this.assertLimits(working);
@@ -761,10 +841,7 @@ export class StaticWorkspaceAuthority {
   }
 
   readFile(projectId, relativePath) {
-    const rel = normalizeRelative(relativePath);
-    const working = this.getWorkingDirectory(projectId);
-    ensureNoLinks(working, rel);
-    return readRegularFileStable(working, rel);
+    return this._readFileForCapture(projectId, relativePath);
   }
 
   computeDigest(projectId) {
