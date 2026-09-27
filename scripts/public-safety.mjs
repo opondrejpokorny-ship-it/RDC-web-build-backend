@@ -1,6 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  listPublicCandidates,
+  readPublicCandidateBytes,
+} from "./public-provenance.mjs";
 
 export const PUBLIC_SAFETY_RULES = Object.freeze([
   { id: "private-github-url", re: /https:\/\/github\.com\/[^\s/]+\/[^\s/]*(?:private|internal|backup)[^\s/]*/i },
@@ -23,29 +27,82 @@ export function scanPublicText(text) {
     .map(({ id }) => id);
 }
 
-export function scanPublicTree(root) {
-  const findings = [];
-  const ignoredDirectories = new Set([".git", "node_modules", "coverage"]);
+function addFindings(relativePath, bytes, findings) {
+  const rules = scanPublicText(bytes.toString("latin1"));
+  for (const rule of rules) findings.push({ file: relativePath, rule });
+}
 
-  function walk(directory) {
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      if (ignoredDirectories.has(entry.name)) continue;
-      const fullPath = path.join(directory, entry.name);
-      if (entry.isDirectory()) {
-        walk(fullPath);
-        continue;
-      }
-      const bytes = fs.readFileSync(fullPath);
-      if (bytes.includes(0)) continue;
-      const rules = scanPublicText(bytes.toString("utf8"));
-      for (const rule of rules) {
-        findings.push({ file: path.relative(root, fullPath), rule });
-      }
-    }
+function readWorktreeBytes(root, relativePath, { missingOkay = false } = {}) {
+  const fullPath = path.join(root, ...relativePath.split("/"));
+  let stat;
+  try {
+    stat = fs.lstatSync(fullPath);
+  } catch (cause) {
+    if (missingOkay && cause?.code === "ENOENT") return null;
+    const error = new Error(`public_safety_worktree_unavailable:${relativePath}`, { cause });
+    error.code = "public_safety_worktree_unavailable";
+    throw error;
   }
 
-  walk(path.resolve(root));
-  return findings;
+  if (stat.isSymbolicLink()) return Buffer.from(fs.readlinkSync(fullPath), "utf8");
+  if (!stat.isFile()) {
+    const error = new Error(`public_safety_worktree_type_unsupported:${relativePath}`);
+    error.code = "public_safety_worktree_type_unsupported";
+    throw error;
+  }
+  try {
+    return fs.readFileSync(fullPath);
+  } catch (cause) {
+    const error = new Error(`public_safety_worktree_unavailable:${relativePath}`, { cause });
+    error.code = "public_safety_worktree_unavailable";
+    throw error;
+  }
+}
+
+export function scanPublicTree(root) {
+  const resolvedRoot = path.resolve(root);
+  const findings = [];
+  let candidates = null;
+
+  try {
+    candidates = listPublicCandidates(resolvedRoot);
+  } catch (error) {
+    if (error?.code !== "public_provenance_git_listing_failed") throw error;
+    candidates = null;
+  }
+
+  if (candidates) {
+    for (const candidate of candidates) {
+      addFindings(candidate.relativePath, readPublicCandidateBytes(resolvedRoot, candidate), findings);
+      if (candidate.source === "index") {
+        const worktreeBytes = readWorktreeBytes(
+          resolvedRoot,
+          candidate.relativePath,
+          { missingOkay: true },
+        );
+        if (worktreeBytes) addFindings(candidate.relativePath, worktreeBytes, findings);
+      }
+    }
+  } else {
+    function walk(directory) {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        if (entry.name === ".git") continue;
+        const fullPath = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          walk(fullPath);
+          continue;
+        }
+        const relativePath = path.relative(resolvedRoot, fullPath).split(path.sep).join("/");
+        addFindings(relativePath, readWorktreeBytes(resolvedRoot, relativePath), findings);
+      }
+    }
+    walk(resolvedRoot);
+  }
+
+  const unique = new Map();
+  for (const finding of findings) unique.set(`${finding.file}\0${finding.rule}`, finding);
+  return [...unique.values()].sort((left, right) =>
+    left.file.localeCompare(right.file) || left.rule.localeCompare(right.rule));
 }
 
 function main() {

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import http from "node:http";
 import path from "node:path";
 import { validateStaticWorkspace } from "../validation/static-validation.mjs";
+import { STATIC_WORKSPACE_DIGEST_VERSION } from "../workspace/static-workspace.mjs";
 
 const MIME = Object.freeze({
   ".html": "text/html; charset=utf-8",
@@ -14,6 +15,22 @@ const MIME = Object.freeze({
   ".jpeg": "image/jpeg",
   ".webp": "image/webp",
 });
+
+function digestCapturedFiles(files) {
+  const hash = crypto.createHash("sha256");
+  hash.update(STATIC_WORKSPACE_DIGEST_VERSION + "\0", "utf8");
+  for (const rel of [...files.keys()].sort((a, b) => a.localeCompare(b))) {
+    const bytes = files.get(rel);
+    const name = Buffer.from(rel, "utf8");
+    const frame = Buffer.alloc(16);
+    frame.writeBigUInt64BE(BigInt(name.length), 0);
+    frame.writeBigUInt64BE(BigInt(bytes.length), 8);
+    hash.update(frame);
+    hash.update(name);
+    hash.update(bytes);
+  }
+  return hash.digest("hex");
+}
 
 function securityHeaders(res) {
   res.setHeader("Cache-Control", "no-store");
@@ -41,6 +58,7 @@ export async function startStaticDevelopmentPreview({ workspace, project_id, exp
     files.set(entry.path, Buffer.from(workspace.readFile(project_id, entry.path)));
   }
   if (workspace.computeDigest(project_id) !== expected_workspace_digest) throw new Error("workspace_digest_mismatch");
+  if (digestCapturedFiles(files) !== expected_workspace_digest) throw new Error("preview_snapshot_digest_mismatch");
 
   const token = crypto.randomBytes(32).toString("hex");
   const preview_id = "preview-" + crypto.randomBytes(16).toString("hex");

@@ -101,6 +101,28 @@ function humanRequest({ projectId, operationId, digest, transition, idempotencyK
   };
 }
 
+test("workspace rejects a configured root that is a symlink or junction redirect", (t) => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "rdc-static-root-parent-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rdc-static-root-outside-"));
+  const redirected = path.join(parent, "managed-root");
+  try {
+    try {
+      fs.symlinkSync(outside, redirected, process.platform === "win32" ? "junction" : "dir");
+    } catch {
+      t.skip("directory symlink/junction creation unavailable on this platform");
+      return;
+    }
+    assert.throws(
+      () => new StaticWorkspaceAuthority(redirected),
+      /workspace_(?:symlink|reparse)_forbidden/,
+    );
+    assert.deepEqual(fs.readdirSync(outside), []);
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 test("workspace digest is deterministic and exact-byte sensitive", () => {
   const tmp = tempRoot();
   try {
@@ -233,6 +255,487 @@ test("workspace rejects symlink escape from managed tree", (t) => {
 
     assert.throws(() => workspace.computeDigest("site-1"), /workspace_symlink_forbidden/);
     assert.throws(() => workspace.readFile("site-1", "escape.txt"), /workspace_symlink_forbidden/);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("workspace rejects a replaced working-root symlink or junction", (t) => {
+  const tmp = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir);
+    workspace.initializeProject("site-1", { "index.html": "managed" });
+    const working = workspace.getWorkingDirectory("site-1");
+    const outside = path.join(tmp.dir, "outside-root");
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, "index.html"), "outside");
+    fs.rmSync(working, { recursive: true, force: true });
+    try {
+      fs.symlinkSync(outside, working, process.platform === "win32" ? "junction" : "dir");
+    } catch {
+      t.skip("directory symlink/junction creation unavailable on this platform");
+      return;
+    }
+
+    assert.throws(
+      () => workspace.computeDigest("site-1"),
+      /workspace_(?:symlink|reparse)_forbidden/,
+    );
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("workspace rejects a projects-parent junction before any escaped content write", (t) => {
+  const tmp = tempRoot();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rdc-static-outside-projects-"));
+  const originalWriteFileSync = fs.writeFileSync;
+  let escapedContentWriteObserved = false;
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir);
+    const projects = path.join(workspace.root, "projects");
+    try {
+      fs.symlinkSync(outside, projects, process.platform === "win32" ? "junction" : "dir");
+    } catch {
+      t.skip("directory symlink/junction creation unavailable on this platform");
+      return;
+    }
+
+    fs.writeFileSync = function patchedWriteFileSync(target, ...args) {
+      if (String(target).endsWith(path.sep + "index.html")) {
+        const realParent = fs.realpathSync.native(path.dirname(String(target)));
+        const normalizedRoot = process.platform === "win32" ? workspace.root.toLowerCase() : workspace.root;
+        const normalizedParent = process.platform === "win32" ? realParent.toLowerCase() : realParent;
+        if (!normalizedParent.startsWith(normalizedRoot + path.sep)) escapedContentWriteObserved = true;
+      }
+      return originalWriteFileSync.call(fs, target, ...args);
+    };
+
+    assert.throws(
+      () => workspace.initializeProject("site-1", { "index.html": "must-not-escape" }),
+      /workspace_(?:symlink|reparse)_forbidden/,
+    );
+    assert.equal(escapedContentWriteObserved, false);
+  } finally {
+    fs.writeFileSync = originalWriteFileSync;
+    tmp.cleanup();
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("snapshot capture rejects a snapshots-parent junction before creating escaped state", (t) => {
+  const tmp = tempRoot();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rdc-static-outside-snapshots-"));
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir);
+    workspace.initializeProject("site-1", { "index.html": "accepted" });
+    const digest = workspace.computeDigest("site-1");
+    const snapshots = path.join(workspace.projectRoot("site-1"), "snapshots");
+    try {
+      fs.symlinkSync(outside, snapshots, process.platform === "win32" ? "junction" : "dir");
+    } catch {
+      t.skip("directory symlink/junction creation unavailable on this platform");
+      return;
+    }
+
+    assert.throws(
+      () => workspace.captureAcceptedBaseline("site-1", {
+        expected_workspace_digest: digest,
+      }),
+      /workspace_(?:symlink|reparse)_forbidden/,
+    );
+    assert.deepEqual(fs.readdirSync(outside), []);
+  } finally {
+    tmp.cleanup();
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("workspace read fails closed if a file is swapped after path validation", (t) => {
+  const tmp = tempRoot();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rdc-static-outside-read-"));
+  const originalReadFileSync = fs.readFileSync;
+  let swapped = false;
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir);
+    workspace.initializeProject("site-1", { "index.html": "managed" });
+    const target = path.join(workspace.getWorkingDirectory("site-1"), "index.html");
+    const secret = path.join(outside, "secret.txt");
+    fs.writeFileSync(secret, "outside-secret");
+
+    fs.readFileSync = function patchedReadFileSync(fileOrFd, ...args) {
+      if (!swapped && typeof fileOrFd === "string" && path.resolve(fileOrFd) === path.resolve(target)) {
+        try {
+          fs.unlinkSync(target);
+          fs.symlinkSync(secret, target, "file");
+          swapped = true;
+        } catch {
+          t.skip("symlink swap unavailable on this platform");
+        }
+      }
+      return originalReadFileSync.call(fs, fileOrFd, ...args);
+    };
+
+    assert.equal(
+      workspace.readFile("site-1", "index.html").toString("utf8"),
+      "managed",
+    );
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+    tmp.cleanup();
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("workspace read detects a swap between lstat and file open", (t) => {
+  const tmp = tempRoot();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rdc-static-outside-open-"));
+  const originalOpenSync = fs.openSync;
+  let swapped = false;
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir);
+    workspace.initializeProject("site-1", { "index.html": "managed" });
+    const target = path.join(workspace.getWorkingDirectory("site-1"), "index.html");
+    const secret = path.join(outside, "secret.txt");
+    fs.writeFileSync(secret, "outside-secret");
+
+    fs.openSync = function patchedOpenSync(filePath, ...args) {
+      if (!swapped && typeof filePath === "string" && path.resolve(filePath) === path.resolve(target)) {
+        try {
+          fs.unlinkSync(target);
+          fs.symlinkSync(secret, target, "file");
+          swapped = true;
+        } catch {
+          t.skip("symlink swap unavailable on this platform");
+        }
+      }
+      return originalOpenSync.call(fs, filePath, ...args);
+    };
+
+    assert.throws(
+      () => workspace.readFile("site-1", "index.html"),
+      /workspace_(?:symlink|reparse|file_identity)_/,
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    tmp.cleanup();
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("workspace swap journal is created once and never rewritten in place", () => {
+  const tmp = tempRoot();
+  const originalOpenSync = fs.openSync;
+  let journalOpens = 0;
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir);
+    workspace.initializeProject("site-1", { "index.html": "before" });
+    const digest = workspace.computeDigest("site-1");
+
+    fs.openSync = function patchedOpenSync(target, flags, ...args) {
+      if (typeof target === "string" && target.endsWith(".workspace-swap.json")) {
+        journalOpens += 1;
+        assert.equal(flags, "wx");
+      }
+      return originalOpenSync.call(fs, target, flags, ...args);
+    };
+
+    const changed = workspace.applyChange("site-1", {
+      expected_workspace_digest: digest,
+      operations: [{ type: "write", path: "index.html", content: "after" }],
+    });
+    assert.notEqual(changed.workspace_digest, digest);
+    assert.equal(journalOpens, 1);
+    assert.equal(
+      fs.existsSync(path.join(workspace.projectRoot("site-1"), ".workspace-swap.json")),
+      false,
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    tmp.cleanup();
+  }
+});
+
+test("new workspace authority rolls back a prepared swap after a crash between renames", () => {
+  const tmp = tempRoot();
+  const next = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir);
+    workspace.initializeProject("site-1", { "index.html": "before" });
+    const beforeDigest = workspace.computeDigest("site-1");
+
+    const nextWorkspace = new StaticWorkspaceAuthority(next.dir);
+    nextWorkspace.initializeProject("site-1", { "index.html": "after" });
+    const afterDigest = nextWorkspace.computeDigest("site-1");
+
+    const projectRoot = workspace.projectRoot("site-1");
+    const working = workspace.getWorkingDirectory("site-1");
+    const token = "333333333333333333333333333333333333333333333333";
+    const staging = path.join(projectRoot, ".swap-n-" + token);
+    const backup = path.join(projectRoot, ".swap-o-" + token);
+    fs.cpSync(nextWorkspace.getWorkingDirectory("site-1"), staging, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectRoot, ".workspace-swap.json"),
+      JSON.stringify({
+        version: "rdc-static-workspace-swap-v1",
+        op: "apply",
+        phase: "PREPARED",
+        token,
+        old_digest: beforeDigest,
+        new_digest: afterDigest,
+      }) + "\n",
+    );
+    fs.renameSync(working, backup);
+
+    const recovered = new StaticWorkspaceAuthority(tmp.dir);
+    assert.equal(recovered.computeDigest("site-1"), beforeDigest);
+    assert.equal(recovered.readFile("site-1", "index.html").toString("utf8"), "before");
+    assert.equal(fs.existsSync(staging), false);
+    assert.equal(fs.existsSync(backup), false);
+    assert.equal(fs.existsSync(path.join(projectRoot, ".workspace-swap.json")), false);
+  } finally {
+    tmp.cleanup();
+    next.cleanup();
+  }
+});
+
+test("new workspace authority preserves a committed promoted tree and cleans crash leftovers", () => {
+  const tmp = tempRoot();
+  const next = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir);
+    workspace.initializeProject("site-1", { "index.html": "before" });
+    const beforeDigest = workspace.computeDigest("site-1");
+
+    const nextWorkspace = new StaticWorkspaceAuthority(next.dir);
+    nextWorkspace.initializeProject("site-1", { "index.html": "after" });
+    const afterDigest = nextWorkspace.computeDigest("site-1");
+
+    const projectRoot = workspace.projectRoot("site-1");
+    const working = workspace.getWorkingDirectory("site-1");
+    const token = "666666666666666666666666666666666666666666666666";
+    const staging = path.join(projectRoot, ".swap-n-" + token);
+    const backup = path.join(projectRoot, ".swap-o-" + token);
+    fs.cpSync(nextWorkspace.getWorkingDirectory("site-1"), staging, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectRoot, ".workspace-swap.json"),
+      JSON.stringify({
+        version: "rdc-static-workspace-swap-v1",
+        op: "restore",
+        phase: "PREPARED",
+        token,
+        old_digest: beforeDigest,
+        new_digest: afterDigest,
+      }) + "\n",
+    );
+    fs.renameSync(working, backup);
+    fs.renameSync(staging, working);
+
+    const recovered = new StaticWorkspaceAuthority(tmp.dir);
+    assert.equal(recovered.computeDigest("site-1"), afterDigest);
+    assert.equal(recovered.readFile("site-1", "index.html").toString("utf8"), "after");
+    assert.equal(fs.existsSync(staging), false);
+    assert.equal(fs.existsSync(backup), false);
+    assert.equal(fs.existsSync(path.join(projectRoot, ".workspace-swap.json")), false);
+  } finally {
+    tmp.cleanup();
+    next.cleanup();
+  }
+});
+
+test("workspace mutation lock recovers a dead owner without weakening digest checks", () => {
+  const tmp = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir, {
+      hostname: "test-host",
+      now: () => Date.now() + 60_000,
+      processIsAlive: () => false,
+      processStartIdentity: () => "current-test-identity",
+    });
+    workspace.initializeProject("site-1", { "index.html": "v1" });
+    const digest = workspace.computeDigest("site-1");
+    const lockPath = path.join(workspace.projectRoot("site-1"), ".workspace.lock");
+    fs.writeFileSync(
+      lockPath,
+      JSON.stringify({
+        owner_id: "aaaaaaaaaaaaaaaa",
+        pid: 424242,
+        hostname: "test-host",
+        process_start_identity: "dead-owner-identity",
+        created_at_ms: 1,
+      }) + "\n",
+    );
+
+    const changed = workspace.applyChange("site-1", {
+      expected_workspace_digest: digest,
+      operations: [{ type: "write", path: "index.html", content: "v2" }],
+    });
+    assert.notEqual(changed.workspace_digest, digest);
+    assert.equal(workspace.readFile("site-1", "index.html").toString("utf8"), "v2");
+    assert.equal(fs.existsSync(lockPath), false);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("workspace mutation lock never evicts a verified live owner by age alone", () => {
+  const tmp = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir, {
+      staleLockMs: 1,
+      hostname: "test-host",
+      now: () => Date.now() + 60_000,
+      processIsAlive: () => true,
+      processStartIdentity: () => "same-live-identity",
+    });
+    workspace.initializeProject("site-1", { "index.html": "v1" });
+    const digest = workspace.computeDigest("site-1");
+    const lockPath = path.join(workspace.projectRoot("site-1"), ".workspace.lock");
+    fs.writeFileSync(
+      lockPath,
+      JSON.stringify({
+        owner_id: "bbbbbbbbbbbbbbbb",
+        pid: 424243,
+        hostname: "test-host",
+        process_start_identity: "same-live-identity",
+        created_at_ms: 1,
+      }) + "\n",
+    );
+
+    assert.throws(
+      () => workspace.applyChange("site-1", {
+        expected_workspace_digest: digest,
+        operations: [{ type: "write", path: "index.html", content: "must-not-land" }],
+      }),
+      /workspace_busy/,
+    );
+    assert.equal(fs.existsSync(lockPath), true);
+    assert.equal(workspace.readFile("site-1", "index.html").toString("utf8"), "v1");
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("workspace mutation lock recovers an old empty lock left before owner write", () => {
+  const tmp = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir, {
+      staleLockMs: 1_000,
+      hostname: "test-host",
+      now: () => Date.now() + 60_000,
+      processIsAlive: () => true,
+      processStartIdentity: () => "current-test-identity",
+    });
+    workspace.initializeProject("site-1", { "index.html": "v1" });
+    const digest = workspace.computeDigest("site-1");
+    const lockPath = path.join(workspace.projectRoot("site-1"), ".workspace.lock");
+    fs.writeFileSync(lockPath, "");
+
+    const changed = workspace.applyChange("site-1", {
+      expected_workspace_digest: digest,
+      operations: [{ type: "write", path: "index.html", content: "v2" }],
+    });
+    assert.notEqual(changed.workspace_digest, digest);
+    assert.equal(fs.existsSync(lockPath), false);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("workspace lock owner verifies the pathname still names its own lock before mutating", () => {
+  const tmp = tempRoot();
+  const originalWriteFileSync = fs.writeFileSync;
+  let injected = false;
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir, {
+      hostname: "test-host",
+      processIsAlive: () => true,
+      processStartIdentity: () => "same-live-identity",
+    });
+    workspace.initializeProject("site-1", { "index.html": "v1" });
+    const digest = workspace.computeDigest("site-1");
+    const lockPath = path.join(workspace.projectRoot("site-1"), ".workspace.lock");
+    const replacement = JSON.stringify({
+      owner_id: "cccccccccccccccc",
+      pid: 434343,
+      hostname: "foreign-host",
+      process_start_identity: "foreign-identity",
+      created_at_ms: Date.now(),
+    }) + "\n";
+
+    fs.writeFileSync = function patchedWriteFileSync(target, ...args) {
+      if (!injected && typeof target === "number") {
+        injected = true;
+        fs.unlinkSync(lockPath);
+        originalWriteFileSync.call(fs, lockPath, replacement, "utf8");
+      }
+      return originalWriteFileSync.call(fs, target, ...args);
+    };
+
+    assert.throws(
+      () => workspace.applyChange("site-1", {
+        expected_workspace_digest: digest,
+        operations: [{ type: "write", path: "index.html", content: "must-not-land" }],
+      }),
+      /workspace_busy/,
+    );
+    assert.equal(fs.readFileSync(lockPath, "utf8"), replacement);
+    assert.equal(workspace.readFile("site-1", "index.html").toString("utf8"), "v1");
+  } finally {
+    fs.writeFileSync = originalWriteFileSync;
+    tmp.cleanup();
+  }
+});
+
+test("workspace mutations fail closed while the project mutation lock is held", () => {
+  const tmp = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir);
+    workspace.initializeProject("site-1", { "index.html": "accepted" });
+    const acceptedDigest = workspace.computeDigest("site-1");
+    const snapshot = workspace.captureAcceptedBaseline("site-1", {
+      expected_workspace_digest: acceptedDigest,
+    });
+    const lockPath = path.join(workspace.projectRoot("site-1"), ".workspace.lock");
+    const heldLock = JSON.stringify({
+      owner_id: "dddddddddddddddd",
+      pid: 454545,
+      hostname: "foreign-host",
+      process_start_identity: "foreign-identity",
+      created_at_ms: Date.now(),
+    }) + "\n";
+
+    fs.writeFileSync(lockPath, heldLock);
+    assert.throws(
+      () => workspace.applyChange("site-1", {
+        expected_workspace_digest: acceptedDigest,
+        operations: [{ type: "write", path: "index.html", content: "blocked" }],
+      }),
+      /workspace_busy/,
+    );
+    assert.throws(
+      () => workspace.captureAcceptedBaseline("site-1", {
+        expected_workspace_digest: acceptedDigest,
+      }),
+      /workspace_busy/,
+    );
+    assert.equal(workspace.readFile("site-1", "index.html").toString("utf8"), "accepted");
+
+    fs.unlinkSync(lockPath);
+    const changed = workspace.applyChange("site-1", {
+      expected_workspace_digest: acceptedDigest,
+      operations: [{ type: "write", path: "index.html", content: "working" }],
+    });
+
+    fs.writeFileSync(lockPath, heldLock);
+    assert.throws(
+      () => workspace.restoreAcceptedBaseline("site-1", snapshot.snapshot_id, {
+        expected_workspace_digest: changed.workspace_digest,
+        expected_snapshot_digest: snapshot.digest,
+      }),
+      /workspace_busy/,
+    );
+    assert.equal(workspace.readFile("site-1", "index.html").toString("utf8"), "working");
   } finally {
     tmp.cleanup();
   }
@@ -751,6 +1254,30 @@ test("concurrent previews use distinct strong tokens and no lifecycle side effec
   } finally {
     if (a) await a.close();
     if (b) await b.close();
+    tmp.cleanup();
+  }
+});
+
+test("preview rejects captured bytes that do not match the reviewed digest", async () => {
+  const tmp = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir);
+    workspace.initializeProject("site-1", { "index.html": "<h1>REVIEWED</h1>" });
+    const digest = workspace.computeDigest("site-1");
+    const originalRead = workspace.readFile.bind(workspace);
+    workspace.readFile = (projectId, relativePath) => (
+      relativePath === "index.html" ? Buffer.from("<h1>UNREVIEWED-RACE</h1>") : originalRead(projectId, relativePath)
+    );
+
+    await assert.rejects(
+      startStaticDevelopmentPreview({
+        workspace,
+        project_id: "site-1",
+        expected_workspace_digest: digest,
+      }),
+      /preview_snapshot_digest_mismatch/,
+    );
+  } finally {
     tmp.cleanup();
   }
 });
