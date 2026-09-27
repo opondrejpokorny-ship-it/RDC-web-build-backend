@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { evaluateTransition } from "../contracts/lifecycle.mjs";
+import { validateStaticWorkspace } from "../validation/static-validation.mjs";
 import {
   HUMAN_GATED_TRANSITIONS,
   hasMutationAuthorizationShape,
@@ -290,7 +291,17 @@ export class StaticLifecycleService {
       if (!gate.ok) return gate;
 
       if (transition === "accept") {
-        const captured = this.workspaceAuthority.captureAcceptedBaseline(project.project_id);
+        const validation = validateStaticWorkspace({
+          workspace: this.workspaceAuthority,
+          project_id: project.project_id,
+          expected_workspace_digest: authoritativeDigest,
+        });
+        if (!validation.ok) {
+          return fail("workspace_validation_failed", { findings: validation.findings });
+        }
+        const captured = this.workspaceAuthority.captureAcceptedBaseline(project.project_id, {
+          expected_workspace_digest: authoritativeDigest,
+        });
         if (!captured || !nonEmptyString(captured.snapshot_id) || captured.digest !== authoritativeDigest) {
           return fail("accepted_baseline_capture_failed");
         }
@@ -306,6 +317,10 @@ export class StaticLifecycleService {
         const restored = this.workspaceAuthority.restoreAcceptedBaseline(
           project.project_id,
           project.accepted_snapshot_id,
+          {
+            expected_workspace_digest: authoritativeDigest,
+            expected_snapshot_digest: project.accepted_workspace_digest,
+          },
         );
         if (!restored || restored.digest !== project.accepted_workspace_digest) {
           return fail("accepted_baseline_restore_failed");

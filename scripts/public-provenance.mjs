@@ -6,47 +6,176 @@ import { fileURLToPath } from "node:url";
 
 export const ATTESTATION_PATH = "docs/PUBLIC_SOURCE_ATTESTATION.json";
 
-function normalizeRepoPath(value) {
-  return value.replaceAll("\\", "/");
+export function decodeGitPathBytes(rawPath) {
+  if (!Buffer.isBuffer(rawPath) || rawPath.length === 0) {
+    throw new TypeError("public_provenance_git_path_bytes_required");
+  }
+  const decoded = rawPath.toString("utf8");
+  if (!Buffer.from(decoded, "utf8").equals(rawPath)) {
+    const error = new Error("public_provenance_invalid_utf8_path");
+    error.code = "public_provenance_invalid_utf8_path";
+    throw error;
+  }
+  return process.platform === "win32" ? decoded.replaceAll("\\", "/") : decoded;
+}
+
+function splitNulTerminated(output) {
+  const entries = [];
+  let start = 0;
+  for (let index = 0; index < output.length; index += 1) {
+    if (output[index] !== 0) continue;
+    if (index > start) entries.push(output.subarray(start, index));
+    start = index + 1;
+  }
+  if (start !== output.length) {
+    const error = new Error("public_provenance_git_output_unterminated");
+    error.code = "public_provenance_git_output_unterminated";
+    throw error;
+  }
+  return entries;
+}
+
+function runGitBuffer(root, args, code = "public_provenance_git_listing_failed") {
+  try {
+    return execFileSync(
+      "git",
+      args,
+      { cwd: root, encoding: null, stdio: ["ignore", "pipe", "ignore"] },
+    );
+  } catch (cause) {
+    const error = new Error(code, { cause });
+    error.code = code;
+    throw error;
+  }
+}
+
+function parseTrackedIndex(output) {
+  return splitNulTerminated(output).map((record) => {
+    const tab = record.indexOf(0x09);
+    if (tab <= 0) {
+      const error = new Error("public_provenance_git_stage_format_invalid");
+      error.code = "public_provenance_git_stage_format_invalid";
+      throw error;
+    }
+    const header = record.subarray(0, tab).toString("ascii");
+    const match = /^(\d{6}) ([0-9a-f]{40,64}) ([0-3])$/.exec(header);
+    if (!match || match[3] !== "0") {
+      const error = new Error("public_provenance_git_stage_format_invalid");
+      error.code = "public_provenance_git_stage_format_invalid";
+      throw error;
+    }
+    return Object.freeze({
+      relativePath: decodeGitPathBytes(record.subarray(tab + 1)),
+      source: "index",
+      mode: match[1],
+      oid: match[2],
+    });
+  });
+}
+
+export function listPublicCandidates(root) {
+  const resolvedRoot = path.resolve(root);
+  const tracked = parseTrackedIndex(
+    runGitBuffer(resolvedRoot, ["ls-files", "--stage", "-z"]),
+  );
+  const untracked = splitNulTerminated(
+    runGitBuffer(resolvedRoot, ["ls-files", "--others", "--exclude-standard", "-z"]),
+  ).map((rawPath) => Object.freeze({
+    relativePath: decodeGitPathBytes(rawPath),
+    source: "worktree",
+    mode: null,
+    oid: null,
+  }));
+
+  const seen = new Set();
+  const candidates = [];
+  for (const candidate of [...tracked, ...untracked]) {
+    if (seen.has(candidate.relativePath)) {
+      const error = new Error("public_provenance_candidate_collision");
+      error.code = "public_provenance_candidate_collision";
+      throw error;
+    }
+    seen.add(candidate.relativePath);
+    candidates.push(candidate);
+  }
+  return Object.freeze(candidates.sort((a, b) => a.relativePath.localeCompare(b.relativePath)));
 }
 
 export function listPublicCandidateFiles(root) {
-  const output = execFileSync(
-    "git",
-    ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-    { cwd: root, encoding: "utf8" },
-  );
+  return listPublicCandidates(root)
+    .filter((candidate) => candidate.relativePath !== ATTESTATION_PATH)
+    .map((candidate) => candidate.relativePath);
+}
 
-  return output
-    .split("\0")
-    .filter(Boolean)
-    .map(normalizeRepoPath)
-    .filter((relativePath) => relativePath !== ATTESTATION_PATH)
-    .filter((relativePath) => {
-      const fullPath = path.join(root, ...relativePath.split("/"));
-      return fs.existsSync(fullPath) && fs.lstatSync(fullPath).isFile();
-    })
-    .sort();
+export function readPublicCandidateBytes(root, candidate) {
+  const resolvedRoot = path.resolve(root);
+  if (!candidate || typeof candidate.relativePath !== "string") {
+    throw new TypeError("public_provenance_candidate_required");
+  }
+
+  if (candidate.source === "index") {
+    if (!["100644", "100755"].includes(candidate.mode)) {
+      const error = new Error(`public_provenance_mode_unsupported:${candidate.relativePath}`);
+      error.code = "public_provenance_mode_unsupported";
+      throw error;
+    }
+    return runGitBuffer(
+      resolvedRoot,
+      ["cat-file", "blob", candidate.oid],
+      "public_provenance_git_blob_unavailable",
+    );
+  }
+
+  if (candidate.source !== "worktree") {
+    const error = new Error("public_provenance_candidate_source_invalid");
+    error.code = "public_provenance_candidate_source_invalid";
+    throw error;
+  }
+
+  const fullPath = path.join(resolvedRoot, ...candidate.relativePath.split("/"));
+  let stat;
+  try {
+    stat = fs.lstatSync(fullPath);
+  } catch (cause) {
+    const error = new Error(`public_provenance_worktree_candidate_unavailable:${candidate.relativePath}`, { cause });
+    error.code = "public_provenance_worktree_candidate_unavailable";
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    const error = new Error(`public_provenance_worktree_type_unsupported:${candidate.relativePath}`);
+    error.code = "public_provenance_worktree_type_unsupported";
+    throw error;
+  }
+  try {
+    return fs.readFileSync(fullPath);
+  } catch (cause) {
+    const error = new Error(`public_provenance_worktree_candidate_unavailable:${candidate.relativePath}`, { cause });
+    error.code = "public_provenance_worktree_candidate_unavailable";
+    throw error;
+  }
+}
+
+export function listUnstagedTrackedFiles(root) {
+  return splitNulTerminated(
+    runGitBuffer(path.resolve(root), ["diff", "--name-only", "-z", "--"]),
+  ).map(decodeGitPathBytes).sort();
 }
 
 export function computePublicSourceEvidence(root) {
   const resolvedRoot = path.resolve(root);
-  const files = listPublicCandidateFiles(resolvedRoot);
+  const candidates = listPublicCandidates(resolvedRoot)
+    .filter((candidate) => candidate.relativePath !== ATTESTATION_PATH);
   const hash = crypto.createHash("sha256");
 
-  for (const relativePath of files) {
-    const fullPath = path.join(resolvedRoot, ...relativePath.split("/"));
-    const stat = fs.lstatSync(fullPath);
-    if (stat.isSymbolicLink()) {
-      throw new Error(`public_provenance_symlink_unsupported:${relativePath}`);
-    }
-    const bytes = fs.readFileSync(fullPath);
-    hash.update(Buffer.from(relativePath, "utf8"));
+  for (const candidate of candidates) {
+    const bytes = readPublicCandidateBytes(resolvedRoot, candidate);
+    hash.update(Buffer.from(candidate.relativePath, "utf8"));
     hash.update(Buffer.from([0]));
     hash.update(bytes);
     hash.update(Buffer.from([0]));
   }
 
+  const files = candidates.map((candidate) => candidate.relativePath);
   return Object.freeze({
     tree_sha256: `sha256:${hash.digest("hex")}`,
     file_count: files.length,
@@ -60,9 +189,17 @@ export function readPublicSourceAttestation(root) {
 }
 
 export function verifyPublicSourceAttestation(root) {
-  const attestation = readPublicSourceAttestation(root);
-  const evidence = computePublicSourceEvidence(root);
+  const resolvedRoot = path.resolve(root);
+  const attestation = readPublicSourceAttestation(resolvedRoot);
+  const candidates = listPublicCandidates(resolvedRoot);
+  const evidence = computePublicSourceEvidence(resolvedRoot);
   const errors = [];
+
+  const unstagedTracked = listUnstagedTrackedFiles(resolvedRoot);
+  if (unstagedTracked.length > 0) errors.push("git_index_worktree_mismatch");
+  if (candidates.some((candidate) => candidate.source === "worktree")) {
+    errors.push("untracked_candidates");
+  }
 
   if (attestation.version !== 1) errors.push("version");
   if (attestation.scope !== "public_repository_tree") errors.push("scope");
