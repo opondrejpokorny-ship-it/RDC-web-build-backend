@@ -21,6 +21,7 @@ function approvedRequest(overrides = {}, evidenceOverrides = {}) {
   const base = {
     project_id: "project-static-1",
     operation_id: "operation-1",
+    operation_revision: "1",
     expected_workspace_digest: DIGEST,
     idempotency_key: "idem-12345678",
     caller_class: "model_orchestrator",
@@ -32,6 +33,7 @@ function approvedRequest(overrides = {}, evidenceOverrides = {}) {
     transition: "accept",
     project_id: request.project_id,
     operation_id: request.operation_id,
+    operation_revision: request.operation_revision,
     expected_workspace_digest: request.expected_workspace_digest,
     idempotency_key: request.idempotency_key,
     caller_class: request.caller_class,
@@ -111,12 +113,17 @@ test("mutation envelope requires valid identity, digest, caller, and evidence ob
   assert.equal(hasMutationAuthorizationShape({ ...request, project_id: "" }), false);
   assert.equal(hasMutationAuthorizationShape({ ...request, project_id: "   " }), false);
   assert.equal(hasMutationAuthorizationShape({ ...request, operation_id: "\t" }), false);
+  assert.equal(hasMutationAuthorizationShape({ ...request, operation_revision: "" }), false);
+  assert.equal(hasMutationAuthorizationShape({ ...request, operation_revision: "0" }), false);
+  assert.equal(hasMutationAuthorizationShape({ ...request, operation_revision: "01" }), false);
+  assert.equal(hasMutationAuthorizationShape({ ...request, operation_revision: "100000000000000000000" }), false);
   assert.equal(hasMutationAuthorizationShape({ ...request, expected_workspace_digest: "bad" }), false);
   assert.equal(hasMutationAuthorizationShape({ ...request, caller_class: "model_claims_admin" }), false);
   assert.equal(hasMutationAuthorizationShape({ ...request, authorization_evidence: null }), false);
   assert.deepEqual(MUTATION_AUTHORIZATION_FIELDS, [
     "project_id",
     "operation_id",
+    "operation_revision",
     "expected_workspace_digest",
     "idempotency_key",
     "caller_class",
@@ -161,6 +168,14 @@ test("foreign project and operation bindings fail closed", async () => {
     verifyAuthorizationEvidence: trustedVerifier,
   });
   assert.equal(operationResult.error_code, "authorization_binding_mismatch:operation_id");
+
+  const foreignRevision = approvedRequest({}, { operation_revision: "2" });
+  const revisionResult = await evaluateBoundAuthorization(foreignRevision, {
+    transition: "accept",
+    nowMs: NOW,
+    verifyAuthorizationEvidence: trustedVerifier,
+  });
+  assert.equal(revisionResult.error_code, "authorization_binding_mismatch:operation_revision");
 });
 
 test("digest and transition substitution fail closed", async () => {
@@ -285,4 +300,18 @@ test("plain JSON array validation rejects holes and decorated arrays", () => {
 
   const withUndefined = ["x", undefined];
   assert.equal(isPlainJsonValue(withUndefined), false);
+});
+
+test("numeric operation revision is rejected without string coercion", async () => {
+  const request = approvedRequest({ operation_revision: 1 });
+  request.authorization_evidence.operation_revision = 1;
+  assert.equal(hasMutationAuthorizationShape(request), false);
+
+  const result = await evaluateBoundAuthorization(request, {
+    transition: "accept",
+    nowMs: NOW,
+    verifyAuthorizationEvidence: trustedVerifier,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error_code, "authorization_envelope_invalid");
 });

@@ -1,6 +1,7 @@
 export const MUTATION_AUTHORIZATION_FIELDS = Object.freeze([
   "project_id",
   "operation_id",
+  "operation_revision",
   "expected_workspace_digest",
   "idempotency_key",
   "caller_class",
@@ -13,6 +14,7 @@ export const AUTHORIZATION_EVIDENCE_FIELDS = Object.freeze([
   "transition",
   "project_id",
   "operation_id",
+  "operation_revision",
   "expected_workspace_digest",
   "idempotency_key",
   "caller_class",
@@ -34,6 +36,11 @@ export const HUMAN_GATED_TRANSITIONS = Object.freeze([
 ]);
 
 const DIGEST_RE = /^(?:sha256:)?[a-f0-9]{64}$/i;
+const OPERATION_REVISION_RE = /^[1-9][0-9]{0,19}$/;
+
+function validOperationRevision(value) {
+  return typeof value === "string" && OPERATION_REVISION_RE.test(value);
+}
 
 function nonEmptyString(value, max = 256) {
   return typeof value === "string" && value.trim().length > 0 && value.length <= max;
@@ -90,6 +97,7 @@ export function hasMutationAuthorizationShape(value) {
   if (!MUTATION_AUTHORIZATION_FIELDS.every((field) => Object.hasOwn(value, field))) return false;
   if (!nonEmptyString(value.project_id)) return false;
   if (!nonEmptyString(value.operation_id)) return false;
+  if (!validOperationRevision(value.operation_revision)) return false;
   if (!DIGEST_RE.test(value.expected_workspace_digest || "")) return false;
   if (!nonEmptyString(value.idempotency_key)) return false;
   if (!CALLER_CLASSES.includes(value.caller_class)) return false;
@@ -126,6 +134,7 @@ export async function evaluateBoundAuthorization(request, {
     ["transition", transition],
     ["project_id", request.project_id],
     ["operation_id", request.operation_id],
+    ["operation_revision", request.operation_revision],
     ["expected_workspace_digest", request.expected_workspace_digest],
     ["idempotency_key", request.idempotency_key],
     ["caller_class", request.caller_class],
@@ -157,6 +166,7 @@ export async function evaluateBoundAuthorization(request, {
       transition,
       project_id: request.project_id,
       operation_id: request.operation_id,
+      operation_revision: request.operation_revision,
       expected_workspace_digest: request.expected_workspace_digest,
       idempotency_key: request.idempotency_key,
       caller_class: request.caller_class,

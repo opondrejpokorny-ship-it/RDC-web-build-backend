@@ -78,10 +78,18 @@ function snapshotWorkspaceBytes(workspace, projectId) {
   );
 }
 
-function humanRequest({ projectId, operationId, digest, transition, idempotencyKey }) {
+function humanRequest({
+  projectId,
+  operationId,
+  operationRevision = "1",
+  digest,
+  transition,
+  idempotencyKey,
+}) {
   return {
     project_id: projectId,
     operation_id: operationId,
+    operation_revision: operationRevision,
     expected_workspace_digest: digest,
     idempotency_key: idempotencyKey,
     caller_class: "model_orchestrator",
@@ -91,6 +99,7 @@ function humanRequest({ projectId, operationId, digest, transition, idempotencyK
       transition,
       project_id: projectId,
       operation_id: operationId,
+      operation_revision: operationRevision,
       expected_workspace_digest: digest,
       idempotency_key: idempotencyKey,
       caller_class: "model_orchestrator",
@@ -918,6 +927,7 @@ test("workspace authority integrates with lifecycle Accept then Reject restore",
       request: humanRequest({
         projectId: "site-1",
         operationId: "op-2",
+        operationRevision: "2",
         digest: changed.workspace_digest,
         transition: "reject",
         idempotencyKey: "idem-reject-2",
