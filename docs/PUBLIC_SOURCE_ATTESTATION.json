@@ -6,12 +6,12 @@
   "private_source_copied": false,
   "third_party_source_copied": false,
   "reuse_requires_explicit_rights": true,
-  "review_evidence_id": "rdc-website-studio-operation-incarnation-binding-2026-09-27",
+  "review_evidence_id": "rdc-website-studio-review-panel-integration-2026-09-28",
   "review_methods": [
     "semantic_diff_review",
     "codex_terra_p0_p1_review",
     "public_safety_scan"
   ],
-  "tree_sha256": "sha256:530bc764a01d8cde1227d9fee21eb334cd4a813f5ead8a56d261dedca2c87b06",
-  "file_count": 30
+  "tree_sha256": "sha256:45d52f6d8ac6dfbd8a788b1c908f6e6a1dad8830cea27a30630625ca3e50bcab",
+  "file_count": 32
 }

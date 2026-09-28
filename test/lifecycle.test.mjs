@@ -225,10 +225,10 @@ test("denied, expired, future, and unverified evidence fail closed", async () =>
   assert.equal(unverified.error_code, "authorization_unverified");
 });
 
-test("bootstrap claims only the clean-room lifecycle engine that is actually implemented", () => {
+test("bootstrap claims only clean-room components that are actually implemented", () => {
   assert.equal(BACKEND_STATUS.copied_private_source, false);
   assert.equal(BACKEND_STATUS.lifecycle_engine_implemented, true);
-  assert.equal(BACKEND_STATUS.preview_panel_implemented, false);
+  assert.equal(BACKEND_STATUS.preview_panel_implemented, true);
 });
 
 test("authorization envelope accepts only strict plain JSON values", () => {
