@@ -99,6 +99,11 @@ function writeAssetLock(rootDir, metadata) {
   fs.utimesSync(lockPath, when, when);
   return { lockPath, ownerFile, ownerPath };
 }
+
+function managedBlobPath(rootDir, digest) {
+  const hex = digest.slice("sha256:".length);
+  return path.join(rootDir, "blobs", "sha256", hex.slice(0, 2), hex + ".blob");
+}
 test("imports exact local bytes into bounded managed asset metadata", async () => {
   const tmp = tempRoot();
   try {
@@ -328,7 +333,7 @@ test("managed blob tamper is detected on read", async () => {
   try {
     const library = createTestLibrary({ rootDir: tmp.dir, localSource: makeSource() });
     const result = await library.importLocalAsset(request());
-    const blobPath = library.getBlobPathForTesting(result.asset.content_digest);
+    const blobPath = managedBlobPath(tmp.dir, result.asset.content_digest);
     fs.writeFileSync(blobPath, "tampered");
     await assert.rejects(
       () => library.readManagedAsset("site-1", result.asset.asset_id),
@@ -911,7 +916,7 @@ test("project authorization is rechecked after local source read before import p
       /asset_project_unavailable/,
     );
     assert.equal(authorityCalls.filter((call) => call.capability === "asset_import").length, 2);
-    assert.equal(fs.existsSync(library.getBlobPathForTesting(PNG_DIGEST)), false);
+    assert.equal(fs.existsSync(managedBlobPath(tmp.dir, PNG_DIGEST)), false);
 
     revoked = false;
     assert.deepEqual(await library.listAssets("site-1"), []);
@@ -1155,5 +1160,229 @@ test("old live PID with a different process-start identity is recovered as stale
     const result = await library.importLocalAsset(request({ idempotency_key: "recover-reused-pid" }));
     assert.equal(result.ok, true);
     assert.equal(fs.existsSync(lock.lockPath), false);
+  } finally { tmp.cleanup(); }
+});
+
+test("public library surface never exposes managed storage paths or test-only blob hooks", () => {
+  const tmp = tempRoot();
+  try {
+    const library = createTestLibrary({ rootDir: tmp.dir, localSource: makeSource() });
+    assert.deepEqual(Object.keys(library).sort(), [
+      "getAsset",
+      "importLocalAsset",
+      "listAssets",
+      "readManagedAsset",
+    ]);
+    assert.equal("getBlobPathForTesting" in library, false);
+    assert.doesNotMatch(JSON.stringify(library), /blobs|assets-index|rdc-assets/i);
+  } finally { tmp.cleanup(); }
+});
+
+test("filesystem failures are sanitized and never disclose managed storage paths", async () => {
+  const tmp = tempRoot();
+  const privateDetail = path.join(tmp.dir, "sensitive-storage-path");
+  try {
+    const originalMkdir = fs.mkdirSync;
+    fs.mkdirSync = function patchedMkdir(target, ...args) {
+      if (path.resolve(String(target)) === path.resolve(tmp.dir)) {
+        const error = new Error("EACCES: permission denied, mkdir '" + privateDetail + "'");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalMkdir.call(this, target, ...args);
+    };
+    try {
+      assert.throws(
+        () => createTestLibrary({ rootDir: tmp.dir, localSource: makeSource() }),
+        (error) => {
+          assert.equal(error.code, "asset_store_failure");
+          assert.equal(error.message, "asset_store_failure");
+          assert.doesNotMatch(JSON.stringify(error), /sensitive-storage-path|rdc-assets/i);
+          return true;
+        },
+      );
+    } finally {
+      fs.mkdirSync = originalMkdir;
+    }
+
+    const library = createTestLibrary({ rootDir: tmp.dir, localSource: makeSource() });
+    const originalRename = fs.renameSync;
+    fs.renameSync = function patchedRename(from, to, ...args) {
+      if (String(to).includes(path.join("blobs", "sha256"))) {
+        const error = new Error("EACCES: permission denied, rename '" + privateDetail + "'");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalRename.call(this, from, to, ...args);
+    };
+    try {
+      await assert.rejects(
+        () => library.importLocalAsset(request({ idempotency_key: "sanitize-store-failure" })),
+        (error) => {
+          assert.equal(error.code, "asset_store_failure");
+          assert.equal(error.message, "asset_store_failure");
+          assert.doesNotMatch(JSON.stringify(error), /sensitive-storage-path|rdc-assets/i);
+          return true;
+        },
+      );
+    } finally {
+      fs.renameSync = originalRename;
+    }
+    assert.equal(fs.existsSync(path.join(tmp.dir, "assets-index.json.lock")), false);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("foreign-host asset lock ownership fails closed in the single-machine lock scope", async () => {
+  const tmp = tempRoot();
+  try {
+    const lock = writeAssetLock(tmp.dir, {
+      owner_id: crypto.randomUUID(),
+      pid: 2147483000,
+      hostname: "another-host",
+      process_start_identity: "foreign-process",
+      created_at_ms: Date.now() - 60_000,
+    });
+    const library = createTestLibrary({
+      rootDir: tmp.dir,
+      localSource: makeSource(),
+      lockOptions: { staleLockMs: 10, waitMs: 40, retryMs: 5 },
+    });
+    await assert.rejects(
+      () => library.importLocalAsset(request({ idempotency_key: "foreign-host-fail-closed" })),
+      /asset_store_busy/,
+    );
+    assert.equal(fs.existsSync(lock.ownerPath), true);
+  } finally { tmp.cleanup(); }
+});
+
+test("shared lock is published only after complete owner metadata exists", async () => {
+  const tmp = tempRoot();
+  const sharedLockPath = path.join(tmp.dir, "assets-index.json.lock");
+  const originalOpen = fs.openSync;
+  let sawOwnerCreate = false;
+  let sharedLockVisibleDuringOwnerCreate = null;
+  try {
+    fs.openSync = function patchedOpen(target, ...args) {
+      if (path.basename(String(target)).startsWith("owner-")) {
+        sawOwnerCreate = true;
+        sharedLockVisibleDuringOwnerCreate = fs.existsSync(sharedLockPath);
+      }
+      return originalOpen.call(this, target, ...args);
+    };
+    const library = createTestLibrary({ rootDir: tmp.dir, localSource: makeSource() });
+    const result = await library.importLocalAsset(request({ idempotency_key: "owner-before-publish" }));
+    assert.equal(result.ok, true);
+  } finally {
+    fs.openSync = originalOpen;
+  }
+  try {
+    assert.equal(sawOwnerCreate, true);
+    assert.equal(sharedLockVisibleDuringOwnerCreate, false);
+    assert.equal(fs.existsSync(sharedLockPath), false);
+    assert.equal(
+      fs.readdirSync(tmp.dir).some((entry) => entry.startsWith("assets-index.json.lock.candidate-")),
+      false,
+    );
+  } finally { tmp.cleanup(); }
+});
+
+test("valid identifiers colliding with Object.prototype remain own durable state keys", async () => {
+  const tmp = tempRoot();
+  try {
+    const firstSource = makeSource();
+    const first = createTestLibrary({
+      rootDir: tmp.dir,
+      localSource: firstSource,
+      idFactory: () => "asset-" + "p".repeat(32),
+    });
+    const collisionRequest = request({
+      project_id: "constructor",
+      idempotency_key: "toString",
+    });
+    const created = await first.importLocalAsset(collisionRequest);
+    assert.equal(created.asset.project_id, "constructor");
+
+    const replaySource = makeSource();
+    const restarted = createTestLibrary({ rootDir: tmp.dir, localSource: replaySource });
+    const replayed = await restarted.importLocalAsset(collisionRequest);
+    assert.deepEqual(replayed, created);
+    assert.equal(replaySource.calls.length, 0);
+
+    const listed = await restarted.listAssets("constructor");
+    assert.equal(listed.length, 1);
+    assert.deepEqual(listed[0], created.asset);
+
+    const persisted = JSON.parse(fs.readFileSync(path.join(tmp.dir, "assets-index.json"), "utf8"));
+    assert.equal(Object.prototype.hasOwnProperty.call(persisted.projects, "constructor"), true);
+    assert.equal(Object.prototype.hasOwnProperty.call(persisted.idempotency, "toString"), true);
+  } finally { tmp.cleanup(); }
+});
+
+test("idempotent replay rechecks authorization after waiting for the shared mutation lock", async () => {
+  const tmp = tempRoot();
+  try {
+    const exactRequest = request({ idempotency_key: "replay-lock-revocation" });
+    const seeded = createTestLibrary({
+      rootDir: tmp.dir,
+      localSource: makeSource(),
+      idFactory: () => "asset-" + "q".repeat(32),
+    });
+    const created = await seeded.importLocalAsset(exactRequest);
+
+    const lock = writeAssetLock(tmp.dir, {
+      owner_id: crypto.randomUUID(),
+      pid: process.pid,
+      hostname: os.hostname(),
+      process_start_identity: defaultProcessStartIdentity(process.pid),
+      created_at_ms: Date.now(),
+    });
+
+    let revoked = false;
+    let authorityCalls = 0;
+    let releaseFirstAuthorization;
+    const firstAuthorization = new Promise((resolve) => { releaseFirstAuthorization = resolve; });
+    const replaySource = {
+      calls: [],
+      async statLocalFile() {
+        this.calls.push("stat");
+        throw new Error("replay_must_not_touch_source");
+      },
+      async readLocalFile() {
+        this.calls.push("read");
+        throw new Error("replay_must_not_touch_source");
+      },
+    };
+    const replay = createManagedAssetLibrary({
+      rootDir: tmp.dir,
+      localSource: replaySource,
+      projectAuthority: {
+        async authorizeProjectAccess(input) {
+          authorityCalls += 1;
+          if (authorityCalls === 1) releaseFirstAuthorization();
+          return revoked
+            ? { allowed: false, project: { project_id: input.project_id, project_type: "static_web" } }
+            : { allowed: true, project: { project_id: input.project_id, project_type: "static_web" } };
+        },
+      },
+      lockOptions: { staleLockMs: 1000, waitMs: 500, retryMs: 5 },
+    });
+
+    const pending = replay.importLocalAsset(exactRequest);
+    await firstAuthorization;
+    revoked = true;
+    fs.unlinkSync(lock.ownerPath);
+    fs.rmdirSync(lock.lockPath);
+
+    await assert.rejects(
+      () => pending,
+      /asset_project_unavailable/,
+    );
+    assert.equal(authorityCalls, 2);
+    assert.deepEqual(replaySource.calls, []);
+
+    const verify = createTestLibrary({ rootDir: tmp.dir, localSource: makeSource() });
+    assert.deepEqual(await verify.importLocalAsset(exactRequest), created);
   } finally { tmp.cleanup(); }
 });

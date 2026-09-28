@@ -30,10 +30,19 @@ function safeError(code) {
   return error;
 }
 
+function rethrowStoreFailure(error) {
+  if (INTERNAL_ERRORS.has(error)) throw error;
+  throw safeError("asset_store_failure");
+}
+
 function isPlainObject(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
+}
+
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key);
 }
 
 function exactKeys(value, expected) {
@@ -232,9 +241,9 @@ function detectMime(bytes, extension) {
 function defaultState() {
   return {
     version: STATE_VERSION,
-    assets: {},
-    projects: {},
-    idempotency: {},
+    assets: Object.create(null),
+    projects: Object.create(null),
+    idempotency: Object.create(null),
   };
 }
 
@@ -412,7 +421,11 @@ export function createManagedAssetLibrary({
   const blobRoot = path.join(root, "blobs", "sha256");
   let queue = Promise.resolve();
 
-  fs.mkdirSync(root, { recursive: true });
+  try {
+    fs.mkdirSync(root, { recursive: true });
+  } catch (error) {
+    rethrowStoreFailure(error);
+  }
 
   function readLockSnapshot() {
     let stat;
@@ -465,6 +478,7 @@ export function createManagedAssetLibrary({
     }
     const metadata = snapshot.metadata;
     const ageMs = Math.max(0, lockNow() - metadata.created_at_ms);
+    // Same-host multi-process store: foreign-host ownership is fail-closed, never auto-evicted.
     if (metadata.hostname !== lockHostname) return false;
     if (!processIsAlive(metadata.pid)) return true;
     if (ageMs < staleLockMs) return false;
@@ -508,18 +522,31 @@ export function createManagedAssetLibrary({
       created_at_ms: lockNow(),
     };
     const ownerFile = `owner-${ownerId}.json`;
-    fs.mkdirSync(lockPath, { mode: 0o700 });
-    const ownerPath = path.join(lockPath, ownerFile);
+    const candidatePath = lockPath + `.candidate-${process.pid}-${ownerId}`;
+    const candidateOwnerPath = path.join(candidatePath, ownerFile);
+
+    fs.mkdirSync(candidatePath, { mode: 0o700 });
     try {
-      const fd = fs.openSync(ownerPath, "wx", 0o600);
+      const fd = fs.openSync(candidateOwnerPath, "wx", 0o600);
       try {
         fs.writeFileSync(fd, JSON.stringify(metadata) + "\n", "utf8");
         fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
       }
+
+      try {
+        fs.renameSync(candidatePath, lockPath);
+      } catch (error) {
+        if (fs.existsSync(lockPath)) {
+          const contention = new Error("asset_lock_exists");
+          contention.code = "EEXIST";
+          throw contention;
+        }
+        throw error;
+      }
     } catch (error) {
-      try { fs.rmdirSync(lockPath); } catch {}
+      try { fs.rmSync(candidatePath, { recursive: true, force: true }); } catch {}
       throw error;
     }
     return { metadata, ownerFile };
@@ -674,79 +701,86 @@ export function createManagedAssetLibrary({
     const fingerprint = requestFingerprint(request);
 
     return withQueue(async () => {
-      await requireProject(request.project_id, "asset_import");
-      const mutationLock = await acquireMutationLock();
       try {
-        const state = readState();
-      const prior = state.idempotency[request.idempotency_key];
-      if (prior) {
-        if (prior.fingerprint !== fingerprint) throw safeError("asset_idempotency_conflict");
-        const asset = state.assets[prior.asset_id];
-        if (!asset) throw safeError("asset_store_invalid");
-        return Object.freeze({ ok: true, asset: cloneAsset(asset) });
-      }
+        await requireProject(request.project_id, "asset_import");
+        const mutationLock = await acquireMutationLock();
+        try {
+          const state = readState();
+          const prior = hasOwn(state.idempotency, request.idempotency_key)
+            ? state.idempotency[request.idempotency_key]
+            : null;
+          if (prior) {
+            if (prior.fingerprint !== fingerprint) throw safeError("asset_idempotency_conflict");
+            const asset = state.assets[prior.asset_id];
+            if (!asset) throw safeError("asset_store_invalid");
+            await requireProject(request.project_id, "asset_import");
+            return Object.freeze({ ok: true, asset: cloneAsset(asset) });
+          }
 
-      const before = await safeStat(request.local_file_id);
-      if (
-        before.size_bytes !== request.expected_source.size_bytes
-        || before.modified_at !== request.expected_source.modified_at
-      ) {
-        throw safeError("asset_source_stale");
-      }
+          const before = await safeStat(request.local_file_id);
+          if (
+            before.size_bytes !== request.expected_source.size_bytes
+            || before.modified_at !== request.expected_source.modified_at
+          ) {
+            throw safeError("asset_source_stale");
+          }
 
-      const bytes = await safeRead(request.local_file_id);
-      if (bytes.length !== before.size_bytes) throw safeError("asset_source_changed");
-      if (bytes.length > maxAssetBytes) throw safeError("asset_too_large");
+          const bytes = await safeRead(request.local_file_id);
+          if (bytes.length !== before.size_bytes) throw safeError("asset_source_changed");
+          if (bytes.length > maxAssetBytes) throw safeError("asset_too_large");
 
-      const after = await safeStat(request.local_file_id);
-      if (!sameSource(before, after)) throw safeError("asset_source_changed");
+          const after = await safeStat(request.local_file_id);
+          if (!sameSource(before, after)) throw safeError("asset_source_changed");
 
-      const contentDigest = sha256(bytes);
-      if (
-        request.expected_content_digest !== null
-        && request.expected_content_digest !== contentDigest
-      ) {
-        throw safeError("asset_content_digest_mismatch");
-      }
-      const mimeType = detectMime(bytes, before.extension);
+          const contentDigest = sha256(bytes);
+          if (
+            request.expected_content_digest !== null
+            && request.expected_content_digest !== contentDigest
+          ) {
+            throw safeError("asset_content_digest_mismatch");
+          }
+          const mimeType = detectMime(bytes, before.extension);
 
-      const assetId = idFactory();
-      if (typeof assetId !== "string" || !ASSET_ID_RE.test(assetId)) {
-        throw safeError("asset_id_invalid");
-      }
-      if (state.assets[assetId]) throw safeError("asset_id_collision");
+          const assetId = idFactory();
+          if (typeof assetId !== "string" || !ASSET_ID_RE.test(assetId)) {
+            throw safeError("asset_id_invalid");
+          }
+          if (state.assets[assetId]) throw safeError("asset_id_collision");
 
-      const createdAt = now();
-      if (!strictIsoUtc(createdAt)) throw safeError("asset_clock_invalid");
+          const createdAt = now();
+          if (!strictIsoUtc(createdAt)) throw safeError("asset_clock_invalid");
 
-      const asset = {
-        asset_id: assetId,
-        project_id: request.project_id,
-        source_class: "local_file",
-        source_handle_digest: sha256(Buffer.from("local_file_id:" + request.local_file_id, "utf8")),
-        content_digest: contentDigest,
-        size_bytes: bytes.length,
-        mime_type: mimeType,
-        relative_name: basenameFor(before.relative_path),
-        created_at: createdAt,
-      };
-      if (!validateStoredAsset(asset)) throw safeError("asset_store_invalid");
+          const asset = {
+            asset_id: assetId,
+            project_id: request.project_id,
+            source_class: "local_file",
+            source_handle_digest: sha256(Buffer.from("local_file_id:" + request.local_file_id, "utf8")),
+            content_digest: contentDigest,
+            size_bytes: bytes.length,
+            mime_type: mimeType,
+            relative_name: basenameFor(before.relative_path),
+            created_at: createdAt,
+          };
+          if (!validateStoredAsset(asset)) throw safeError("asset_store_invalid");
 
-      await requireProject(request.project_id, "asset_import");
-      writeBlob(contentDigest, bytes);
+          await requireProject(request.project_id, "asset_import");
+          writeBlob(contentDigest, bytes);
 
-      state.assets[assetId] = asset;
-      state.projects[request.project_id] ??= [];
-      state.projects[request.project_id].push(assetId);
-      state.idempotency[request.idempotency_key] = {
-        fingerprint,
-        asset_id: assetId,
-      };
-      writeState(state);
+          state.assets[assetId] = asset;
+          if (!hasOwn(state.projects, request.project_id)) state.projects[request.project_id] = [];
+          state.projects[request.project_id].push(assetId);
+          state.idempotency[request.idempotency_key] = {
+            fingerprint,
+            asset_id: assetId,
+          };
+          writeState(state);
 
-        return Object.freeze({ ok: true, asset: cloneAsset(asset) });
-      } finally {
-        releaseMutationLock(mutationLock);
+          return Object.freeze({ ok: true, asset: cloneAsset(asset) });
+        } finally {
+          releaseMutationLock(mutationLock);
+        }
+      } catch (error) {
+        rethrowStoreFailure(error);
       }
     });
   }
@@ -770,7 +804,7 @@ export function createManagedAssetLibrary({
     if (!validProjectId(projectId)) return Object.freeze([]);
     await requireProject(projectId, "asset_read");
     const state = readState();
-    const ids = state.projects[projectId] ?? [];
+    const ids = hasOwn(state.projects, projectId) ? state.projects[projectId] : [];
     return Object.freeze(ids.map((id) => cloneAsset(state.assets[id])));
   }
 
@@ -796,6 +830,5 @@ export function createManagedAssetLibrary({
     getAsset,
     listAssets,
     readManagedAsset,
-    getBlobPathForTesting: blobPathForDigest,
   });
 }
