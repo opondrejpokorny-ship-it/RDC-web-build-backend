@@ -23,12 +23,13 @@ export { StaticLifecycleService } from "./lifecycle/service.mjs";
 export { STATIC_WORKSPACE_DIGEST_VERSION, StaticWorkspaceAuthority } from "./workspace/static-workspace.mjs";
 export { validateStaticWorkspace } from "./validation/static-validation.mjs";
 export { startStaticDevelopmentPreview } from "./preview/static-preview.mjs";
+export { createReviewSession, startReviewPanelServer } from "./review-panel/review-panel.mjs";
 
 export const BACKEND_STATUS = Object.freeze({
   phase: "static_web_workspace_preview",
   lifecycle_engine_implemented: true,
   workspace_authority_implemented: true,
   development_preview_implemented: true,
-  preview_panel_implemented: false,
+  preview_panel_implemented: true,
   copied_private_source: false,
 });

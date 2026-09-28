@@ -4,6 +4,7 @@ import { validateStaticWorkspace } from "../validation/static-validation.mjs";
 
 const SESSION_INTERNALS = new WeakMap();
 const MAX_ACTION_BODY_BYTES = 4096;
+const REVIEW_SESSION_TTL_MS = 5 * 60 * 1000;
 const ACTIONS_BY_STATE = Object.freeze({
   review_required: Object.freeze(["reject", "accept"]),
   accepted: Object.freeze(["release_prepare"]),
@@ -58,12 +59,22 @@ function requireLifecycleService(value) {
 }
 
 function requireWorkspaceAuthority(value) {
-  if (!value || typeof value.computeDigest !== "function") {
+  if (
+    !value
+    || typeof value.computeDigest !== "function"
+    || typeof value.captureReadView !== "function"
+  ) {
     fail("workspace_authority_required");
   }
 }function requireApprovalAuthority(value) {
   if (!value || typeof value.issueAuthorization !== "function") {
     fail("approval_authority_required");
+  }
+}
+
+function requirePublishedPreviewAuthority(value) {
+  if (!value || typeof value.verifyPublishedPreview !== "function") {
+    fail("published_preview_authority_required");
   }
 }
 
@@ -75,6 +86,22 @@ function readRawPendingExternalOperation(lifecycleService, projectId) {
   const project = state?.projects?.[projectId];
   if (!project) fail("project_not_found");
   return project.pending_external_operation ?? null;
+}
+
+function readRawAttemptState(lifecycleService, projectId, idempotencyKey) {
+  if (!lifecycleService?.store || typeof lifecycleService.store.read !== "function") {
+    fail("lifecycle_pending_state_unavailable");
+  }
+  const state = lifecycleService.store.read();
+  const project = state?.projects?.[projectId];
+  if (!project) fail("project_not_found");
+  const completedRecord = project.idempotency_results?.[idempotencyKey] ?? null;
+  const pending = project.pending_external_operation ?? null;
+  return Object.freeze({
+    completed_matches: Boolean(completedRecord),
+    pending_matches: pending?.idempotency_key === idempotencyKey,
+    foreign_pending: Boolean(pending && pending.idempotency_key !== idempotencyKey),
+  });
 }
 
 function validateDevelopmentPreview(preview, project, digest) {
@@ -102,23 +129,33 @@ function expectedPublishedRelease(project) {
   return project.active_release_id || null;
 }
 
-function validatePublishedPreview(preview, project) {
-  const expectedRelease = expectedPublishedRelease(project);  if (project.workflow_state === "release_ready" && preview == null) {
-    fail("published_preview_required");
-  }
-  if (project.workflow_state === "release_active" && preview == null) {
+function validatePublishedPreview(preview, project, publishedPreviewAuthority) {
+  const expectedRelease = expectedPublishedRelease(project);
+  if (["release_ready", "release_active"].includes(project.workflow_state) && preview == null) {
     fail("published_preview_required");
   }
   if (preview == null) return null;
   if (
-    !preview
-    || preview.project_id !== project.project_id
+    preview.project_id !== project.project_id
     || preview.release_id !== expectedRelease
     || !nonEmptyString(preview.release_id, 256)
     || !safeHttpUrl(preview.url)
   ) {
     fail("published_preview_binding_invalid");
   }
+  requirePublishedPreviewAuthority(publishedPreviewAuthority);
+  let verified = false;
+  try {
+    verified = publishedPreviewAuthority.verifyPublishedPreview({
+      project_id: preview.project_id,
+      release_id: preview.release_id,
+      url: preview.url,
+      expected_workspace_digest: project.accepted_workspace_digest,
+    }) === true;
+  } catch {
+    verified = false;
+  }
+  if (!verified) fail("published_preview_unverified");
   return cloneFrozen({
     project_id: preview.project_id,
     release_id: preview.release_id,
@@ -299,6 +336,7 @@ export function createReviewSession({
   project_id,
   development_preview = null,
   published_preview = null,
+  publishedPreviewAuthority = null,
   now = () => Date.now(),
 }) {  requireLifecycleService(lifecycleService);
   requireWorkspaceAuthority(workspaceAuthority);
@@ -308,8 +346,15 @@ export function createReviewSession({
 
   const project = lifecycleService.getProject(project_id);
   if (!project) fail("project_not_found");
-  const digest = workspaceAuthority.computeDigest(project_id);
-  if (digest !== project.current_workspace_digest) fail("review_session_stale");
+  let readView;
+  try {
+    readView = workspaceAuthority.captureReadView(project_id, {
+      expected_workspace_digest: project.current_workspace_digest,
+    });
+  } catch {
+    fail("review_session_stale");
+  }
+  const digest = readView.workspace_digest;
   if (
     project.pending_external_transition
     || readRawPendingExternalOperation(lifecycleService, project_id) !== null
@@ -323,9 +368,18 @@ export function createReviewSession({
     workspace: workspaceAuthority,
     project_id,
     expected_workspace_digest: digest,
+    read_view: readView,
   });
+  if (validation.ok !== true) fail("static_validation_failed");
   const development = validateDevelopmentPreview(development_preview, project, digest);
-  const published = validatePublishedPreview(published_preview, project);
+  const published = validatePublishedPreview(
+    published_preview,
+    project,
+    publishedPreviewAuthority,
+  );
+  const createdAtMs = now();
+  if (!Number.isFinite(createdAtMs)) fail("review_session_clock_invalid");
+  const expiresAtMs = createdAtMs + REVIEW_SESSION_TTL_MS;
 
   const state = Object.freeze({
     project_id: project.project_id,
@@ -339,7 +393,10 @@ export function createReviewSession({
     ready_release_id: project.ready_release_id,
     active_release_id: project.active_release_id,
     pending_external_transition: project.pending_external_transition,
-    validation: cloneFrozen(validation),    allowed_actions: Object.freeze(actions),
+    created_at: new Date(createdAtMs).toISOString(),
+    expires_at: new Date(expiresAtMs).toISOString(),
+    validation: cloneFrozen(validation),
+    allowed_actions: Object.freeze(actions),
     development_preview: development,
     published_preview: published,
   });
@@ -352,6 +409,9 @@ export function createReviewSession({
     workspaceAuthority,
     approvalAuthority,
     now,
+    created_at_ms: createdAtMs,
+    expires_at_ms: expiresAtMs,
+    attempts: new Map(),
     consumed: false,
     in_flight: false,
     state,
@@ -370,11 +430,46 @@ export function createReviewSession({
   return Object.freeze(session);
 }
 
+function reviewSessionExpired(internals) {
+  try {
+    const nowMs = internals.now();
+    return !Number.isFinite(nowMs) || nowMs >= internals.expires_at_ms;
+  } catch {
+    return true;
+  }
+}
+
+function actionWorkspaceFailure(internals, state) {
+  let readView;
+  try {
+    readView = internals.workspaceAuthority.captureReadView(state.project_id, {
+      expected_workspace_digest: state.workspace_digest,
+    });
+  } catch {
+    return "review_session_stale";
+  }
+
+  try {
+    const validation = validateStaticWorkspace({
+      workspace: internals.workspaceAuthority,
+      project_id: state.project_id,
+      expected_workspace_digest: state.workspace_digest,
+      read_view: readView,
+    });
+    return validation.ok === true ? null : "review_validation_failed";
+  } catch {
+    return "review_validation_failed";
+  }
+}
+
 async function executeSessionAction(session, action) {
   const internals = SESSION_INTERNALS.get(session);
   if (!internals) return { status: 500, body: { error_code: "review_session_invalid" } };
   if (internals.consumed) {
     return { status: 409, body: { error_code: "review_session_consumed" } };
+  }
+  if (reviewSessionExpired(internals)) {
+    return { status: 410, body: { error_code: "review_session_expired" } };
   }
 
   const state = internals.state;
@@ -387,59 +482,109 @@ async function executeSessionAction(session, action) {
 
   internals.in_flight = true;
   try {
-    let project;
-    let digest;
-    let rawPending;
+    let attempt = internals.attempts.get(action) ?? null;
+    let rawAttempt = null;
+    if (attempt?.lifecycle_started) {
+      try {
+        rawAttempt = readRawAttemptState(
+          internals.lifecycleService,
+          state.project_id,
+          attempt.idempotency_key,
+        );
+      } catch {
+        return { status: 409, body: { error_code: "review_session_stale" } };
+      }
+    }
+
+    const persistedExactAttempt = Boolean(
+      rawAttempt?.completed_matches || rawAttempt?.pending_matches,
+    );
+    if (!persistedExactAttempt) {
+      let project;
+      let rawPending;
+      try {
+        project = internals.lifecycleService.getProject(state.project_id);
+        rawPending = readRawPendingExternalOperation(
+          internals.lifecycleService,
+          state.project_id,
+        );
+      } catch {
+        return { status: 409, body: { error_code: "review_session_stale" } };
+      }
+
+      if (
+        rawPending !== null
+        || !projectMatchesSession(project, state)
+      ) {
+        return { status: 409, body: { error_code: "review_session_stale" } };
+      }
+      const workspaceFailure = actionWorkspaceFailure(internals, state);
+      if (workspaceFailure) {
+        return { status: 409, body: { error_code: workspaceFailure } };
+      }
+    }
+
+    if (!attempt) {
+      const idempotency_key = internals.session_id + "-" + action + "-" + randomToken(12);
+      attempt = {
+        idempotency_key,
+        authorization_issued: false,
+        evidence: null,
+        request: null,
+        lifecycle_started: false,
+      };
+      internals.attempts.set(action, attempt);
+    }
+
+    if (!attempt.authorization_issued) {
+      const approvalInput = Object.freeze({
+        transition: action,
+        project_id: state.project_id,
+        operation_id: state.operation_id,
+        operation_revision: state.operation_revision,
+        expected_workspace_digest: state.workspace_digest,
+        idempotency_key: attempt.idempotency_key,
+        caller_class: "human_review_surface",
+      });
+      let evidence;
+      try {
+        evidence = await internals.approvalAuthority.issueAuthorization(approvalInput);
+        attempt.evidence = structuredClone(evidence);
+        attempt.authorization_issued = true;
+      } catch {
+        return { status: 503, body: { error_code: "approval_authority_error" } };
+      }
+      if (reviewSessionExpired(internals)) {
+        return { status: 410, body: { error_code: "review_session_expired" } };
+      }
+      attempt.request = Object.freeze({
+        project_id: state.project_id,
+        operation_id: state.operation_id,
+        operation_revision: state.operation_revision,
+        expected_workspace_digest: state.workspace_digest,
+        idempotency_key: attempt.idempotency_key,
+        caller_class: "human_review_surface",
+        authorization_evidence: attempt.evidence,
+      });
+    }
+
+    if (!attempt.request) {
+      return { status: 500, body: { error_code: "review_attempt_invalid" } };
+    }
+    if (reviewSessionExpired(internals)) {
+      return { status: 410, body: { error_code: "review_session_expired" } };
+    }
+
+    attempt.lifecycle_started = true;
+    let result;
     try {
-      project = internals.lifecycleService.getProject(state.project_id);
-      digest = internals.workspaceAuthority.computeDigest(state.project_id);
-      rawPending = readRawPendingExternalOperation(
-        internals.lifecycleService,
-        state.project_id,
-      );
+      result = await internals.lifecycleService.executeHumanTransition({
+        transition: action,
+        request: attempt.request,
+      });
     } catch {
-      return { status: 409, body: { error_code: "review_session_stale" } };
+      return { status: 503, body: { error_code: "review_transition_error" } };
     }
-
-    if (
-      rawPending !== null
-      || !projectMatchesSession(project, state)
-      || digest !== state.workspace_digest
-    ) {
-      return { status: 409, body: { error_code: "review_session_stale" } };
-    }
-
-    const idempotency_key = internals.session_id + "-" + action + "-" + randomToken(12);
-    const approvalInput = Object.freeze({
-      transition: action,
-      project_id: state.project_id,
-      operation_id: state.operation_id,
-      operation_revision: state.operation_revision,
-      expected_workspace_digest: state.workspace_digest,
-      idempotency_key,
-      caller_class: "human_review_surface",
-    });
-
-    let evidence;
-    try {
-      evidence = await internals.approvalAuthority.issueAuthorization(approvalInput);
-    } catch {
-      return { status: 503, body: { error_code: "approval_authority_error" } };
-    }
-
-    const request = {
-      project_id: state.project_id,
-      operation_id: state.operation_id,
-      operation_revision: state.operation_revision,
-      expected_workspace_digest: state.workspace_digest,
-      idempotency_key,
-      caller_class: "human_review_surface",
-      authorization_evidence: evidence,
-    };
-    const result = await internals.lifecycleService.executeHumanTransition({
-      transition: action,
-      request,
-    });
     if (!result?.ok) {
       return { status: statusForLifecycleFailure(result), body: result };
     }
@@ -475,6 +620,9 @@ export async function startReviewPanelServer({ session }) {
       securityHeaders(res, nonce);
       res.statusCode = 404;
       return res.end();
+    }
+    if (reviewSessionExpired(internals)) {
+      return jsonResponse(res, 410, { error_code: "review_session_expired" }, nonce);
     }
 
     if (rawPath === actionPath) {

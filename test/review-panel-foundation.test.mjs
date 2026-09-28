@@ -12,8 +12,15 @@ import {
   createReviewSession,
   startReviewPanelServer,
 } from "../src/review-panel/review-panel.mjs";
+import * as publicApi from "../src/index.mjs";
 
 const NOW = Date.parse("2026-09-27T13:00:00.000Z");
+
+test("review panel is exposed through the public backend surface", () => {
+  assert.equal(publicApi.createReviewSession, createReviewSession);
+  assert.equal(publicApi.startReviewPanelServer, startReviewPanelServer);
+  assert.equal(publicApi.BACKEND_STATUS.preview_panel_implemented, true);
+});
 
 function tempRoot() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rdc-review-panel-"));
@@ -65,6 +72,17 @@ function createApprovalAuthority() {
         expires_at: "2026-09-27T13:05:00.000Z",
         proof: "trusted-human-proof",
       };
+    },
+  };
+}
+
+function createPublishedPreviewAuthority({ verified = true } = {}) {
+  const calls = [];
+  return {
+    calls,
+    verifyPublishedPreview(input) {
+      calls.push(structuredClone(input));
+      return verified;
     },
   };
 }
@@ -490,6 +508,7 @@ test("Release Prepare and Release Activate require separate fresh sessions", asy
         release_id: preparedBody.state.ready_release_id,
         url: "https://published.invalid/site-1",
       },
+      publishedPreviewAuthority: createPublishedPreviewAuthority(),
       now: () => NOW,
     });
     assert.deepEqual(activateSession.state.allowed_actions, ["release_activate"]);
@@ -717,6 +736,7 @@ test("invalid action is rejected before approval authority is called", async () 
         release_id: prepared.state.ready_release_id,
         url: "https://published.invalid/site-1",
       },
+      publishedPreviewAuthority: createPublishedPreviewAuthority(),
       now: () => NOW,
     });
     assert.deepEqual(valid.state.allowed_actions, ["release_activate"]);
@@ -896,6 +916,7 @@ test("approval authority receives exact bindings for every gated panel action", 
         release_id: prepared.state.ready_release_id,
         url: "https://published.invalid/site-1",
       },
+      publishedPreviewAuthority: createPublishedPreviewAuthority(),
       now: () => NOW,
     });
     panel = await startReviewPanelServer({ session: activateSession });
@@ -1076,6 +1097,277 @@ test("approval authority receives exact bindings for every gated panel action", 
     assert.equal(approvalAuthority.calls.length, 1);
   } finally {
     if (releaseApproval) releaseApproval();
+    if (panel) await panel.close();
+    ctx.tmp.cleanup();
+  }
+});
+
+test("review session fails closed when current static validation fails", () => {
+  const ctx = setupProject();
+  try {
+    const changed = ctx.workspace.applyChange("site-1", {
+      expected_workspace_digest: ctx.digest,
+      operations: [{ type: "delete", path: "index.html" }],
+    });
+    ctx.lifecycle.store.transact((state) => {
+      state.projects["site-1"].current_workspace_digest = changed.workspace_digest;
+    });
+    assert.throws(() => createReviewSession({
+      lifecycleService: ctx.lifecycle,
+      workspaceAuthority: ctx.workspace,
+      approvalAuthority: createApprovalAuthority(),
+      project_id: "site-1",
+      now: () => NOW,
+    }), /static_validation_failed/);
+  } finally {
+    ctx.tmp.cleanup();
+  }
+});
+
+test("review action revalidates immutable workspace before approval", async () => {
+  const ctx = setupProject();
+  let panel;
+  try {
+    const approvalAuthority = createApprovalAuthority();
+    const session = createReviewSession({
+      lifecycleService: ctx.lifecycle,
+      workspaceAuthority: ctx.workspace,
+      approvalAuthority,
+      project_id: "site-1",
+      now: () => NOW,
+    });
+    ctx.workspace.captureReadView = () => Object.freeze({
+      project_id: "site-1",
+      workspace_digest: ctx.digest,
+      listFiles: () => Object.freeze([]),
+      readFile() { throw new Error("workspace_file_not_found"); },
+    });
+    panel = await startReviewPanelServer({ session });
+    const response = await jsonRequest(panel.action_url, {
+      method: "POST",
+      body: { action: "accept", csrf_token: session.csrf_token },
+    });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).error_code, "review_validation_failed");
+    assert.equal(approvalAuthority.calls.length, 0);
+  } finally {
+    if (panel) await panel.close();
+    ctx.tmp.cleanup();
+  }
+});
+
+test("expired review session cannot issue approval", async () => {
+  const ctx = setupProject();
+  let panel;
+  let clock = NOW;
+  try {
+    const approvalAuthority = createApprovalAuthority();
+    const session = createReviewSession({
+      lifecycleService: ctx.lifecycle,
+      workspaceAuthority: ctx.workspace,
+      approvalAuthority,
+      project_id: "site-1",
+      now: () => clock,
+    });
+    panel = await startReviewPanelServer({ session });
+    clock += 5 * 60 * 1000 + 1;
+    const expiredState = await fetch(panel.state_url);
+    assert.equal(expiredState.status, 410);
+    assert.equal((await expiredState.json()).error_code, "review_session_expired");
+    assert.equal((await fetch(panel.url)).status, 410);
+    const response = await jsonRequest(panel.action_url, {
+      method: "POST",
+      body: { action: "accept", csrf_token: session.csrf_token },
+    });
+    assert.equal(response.status, 410);
+    assert.equal((await response.json()).error_code, "review_session_expired");
+    assert.equal(approvalAuthority.calls.length, 0);
+  } finally {
+    if (panel) await panel.close();
+    ctx.tmp.cleanup();
+  }
+});
+test("Published Preview authority rejects unverified release URLs", async () => {
+  const ctx = setupProject();
+  let panel;
+  try {
+    const approvalAuthority = createApprovalAuthority();
+    const acceptSession = createReviewSession({
+      lifecycleService: ctx.lifecycle,
+      workspaceAuthority: ctx.workspace,
+      approvalAuthority,
+      project_id: "site-1",
+      now: () => NOW,
+    });
+    panel = await startReviewPanelServer({ session: acceptSession });
+    assert.equal((await jsonRequest(panel.action_url, {
+      method: "POST",
+      body: { action: "accept", csrf_token: acceptSession.csrf_token },
+    })).status, 200);
+    await panel.close();
+
+    const prepareSession = createReviewSession({
+      lifecycleService: ctx.lifecycle,
+      workspaceAuthority: ctx.workspace,
+      approvalAuthority,
+      project_id: "site-1",
+      now: () => NOW,
+    });
+    panel = await startReviewPanelServer({ session: prepareSession });
+    const prepareResponse = await jsonRequest(panel.action_url, {
+      method: "POST",
+      body: { action: "release_prepare", csrf_token: prepareSession.csrf_token },
+    });
+    assert.equal(prepareResponse.status, 200);
+    const prepared = await prepareResponse.json();
+    await panel.close();
+
+    const publishedPreview = {
+      project_id: "site-1",
+      release_id: prepared.state.ready_release_id,
+      url: "https://published.invalid/site-1",
+    };
+    assert.throws(() => createReviewSession({
+      lifecycleService: ctx.lifecycle,
+      workspaceAuthority: ctx.workspace,
+      approvalAuthority,
+      project_id: "site-1",
+      published_preview: publishedPreview,
+      now: () => NOW,
+    }), /published_preview_authority_required/);
+
+    const authority = createPublishedPreviewAuthority({ verified: false });
+    assert.throws(() => createReviewSession({
+      lifecycleService: ctx.lifecycle,
+      workspaceAuthority: ctx.workspace,
+      approvalAuthority,
+      project_id: "site-1",
+      published_preview: publishedPreview,
+      publishedPreviewAuthority: authority,
+      now: () => NOW,
+    }), /published_preview_unverified/);
+    assert.deepEqual(authority.calls, [{
+      project_id: "site-1",
+      release_id: prepared.state.ready_release_id,
+      url: publishedPreview.url,
+      expected_workspace_digest: ctx.digest,
+    }]);
+  } finally {
+    if (panel) await panel.close();
+    ctx.tmp.cleanup();
+  }
+});
+
+test("ambiguous release response retries one exact Review action", async () => {
+  const ctx = setupProject();
+  let panel;
+  try {
+    const approvalAuthority = createApprovalAuthority();
+    const acceptSession = createReviewSession({
+      lifecycleService: ctx.lifecycle,
+      workspaceAuthority: ctx.workspace,
+      approvalAuthority,
+      project_id: "site-1",
+      now: () => NOW,
+    });
+    panel = await startReviewPanelServer({ session: acceptSession });
+    assert.equal((await jsonRequest(panel.action_url, {
+      method: "POST",
+      body: { action: "accept", csrf_token: acceptSession.csrf_token },
+    })).status, 200);
+    await panel.close();
+
+    const approvalsBeforePrepare = approvalAuthority.calls.length;
+    let loseFirstResponse = true;
+    const lifecycleWrapper = {
+      store: ctx.lifecycle.store,
+      getProject: (...args) => ctx.lifecycle.getProject(...args),
+      async executeHumanTransition(input) {
+        const result = await ctx.lifecycle.executeHumanTransition(input);
+        if (loseFirstResponse && input.transition === "release_prepare") {
+          loseFirstResponse = false;
+          throw new Error("simulated_lost_response");
+        }
+        return result;
+      },
+    };
+
+    const session = createReviewSession({
+      lifecycleService: lifecycleWrapper,
+      workspaceAuthority: ctx.workspace,
+      approvalAuthority,
+      project_id: "site-1",
+      now: () => NOW,
+    });
+    panel = await startReviewPanelServer({ session });
+
+    const first = await jsonRequest(panel.action_url, {
+      method: "POST",
+      body: { action: "release_prepare", csrf_token: session.csrf_token },
+    });
+    assert.equal(first.status, 503);
+    assert.equal((await first.json()).error_code, "review_transition_error");
+    assert.equal(ctx.releaseAuthority.calls.prepare, 1);
+    assert.equal(approvalAuthority.calls.length, approvalsBeforePrepare + 1);
+    const exactIdempotencyKey = approvalAuthority.calls.at(-1).idempotency_key;
+
+    const retry = await jsonRequest(panel.action_url, {
+      method: "POST",
+      body: { action: "release_prepare", csrf_token: session.csrf_token },
+    });
+    assert.equal(retry.status, 200);
+    assert.equal((await retry.json()).state.workflow_state, "release_ready");
+    assert.equal(ctx.releaseAuthority.calls.prepare, 1);
+    assert.equal(approvalAuthority.calls.length, approvalsBeforePrepare + 1);
+    assert.equal(approvalAuthority.calls.at(-1).idempotency_key, exactIdempotencyKey);
+    assert.equal(session.consumed, true);
+  } finally {
+    if (panel) await panel.close();
+    ctx.tmp.cleanup();
+  }
+});
+
+test("approval that returns after session expiry cannot execute lifecycle", async () => {
+  const ctx = setupProject();
+  let panel;
+  let clock = NOW;
+  try {
+    const baseApproval = createApprovalAuthority();
+    const slowApproval = {
+      calls: baseApproval.calls,
+      issueAuthorization(input) {
+        const evidence = baseApproval.issueAuthorization(input);
+        clock += 5 * 60 * 1000 + 1;
+        return evidence;
+      },
+    };
+    const session = createReviewSession({
+      lifecycleService: ctx.lifecycle,
+      workspaceAuthority: ctx.workspace,
+      approvalAuthority: slowApproval,
+      project_id: "site-1",
+      now: () => clock,
+    });
+    panel = await startReviewPanelServer({ session });
+
+    const response = await jsonRequest(panel.action_url, {
+      method: "POST",
+      body: { action: "accept", csrf_token: session.csrf_token },
+    });
+    assert.equal(response.status, 410);
+    assert.equal((await response.json()).error_code, "review_session_expired");
+    assert.equal(baseApproval.calls.length, 1);
+    assert.equal(ctx.lifecycle.getProject("site-1").workflow_state, "review_required");
+    assert.equal(ctx.releaseAuthority.calls.prepare, 0);
+    assert.equal(ctx.releaseAuthority.calls.activate, 0);
+
+    const retry = await jsonRequest(panel.action_url, {
+      method: "POST",
+      body: { action: "accept", csrf_token: session.csrf_token },
+    });
+    assert.equal(retry.status, 410);
+    assert.equal(baseApproval.calls.length, 1);
+  } finally {
     if (panel) await panel.close();
     ctx.tmp.cleanup();
   }
