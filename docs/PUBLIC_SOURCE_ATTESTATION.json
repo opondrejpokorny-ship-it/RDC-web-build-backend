@@ -6,12 +6,12 @@
   "private_source_copied": false,
   "third_party_source_copied": false,
   "reuse_requires_explicit_rights": true,
-  "review_evidence_id": "rdc-website-studio-review-panel-integration-2026-09-28",
+  "review_evidence_id": "rdc-website-studio-media-library-integration-2026-09-28",
   "review_methods": [
     "semantic_diff_review",
     "codex_terra_p0_p1_review",
     "public_safety_scan"
   ],
-  "tree_sha256": "sha256:45d52f6d8ac6dfbd8a788b1c908f6e6a1dad8830cea27a30630625ca3e50bcab",
-  "file_count": 32
+  "tree_sha256": "sha256:8c7aed6590a7142a552e2d85eebfaf121c17f25549e69c859ed7b2625e8645aa",
+  "file_count": 35
 }

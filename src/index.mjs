@@ -24,6 +24,7 @@ export { STATIC_WORKSPACE_DIGEST_VERSION, StaticWorkspaceAuthority } from "./wor
 export { validateStaticWorkspace } from "./validation/static-validation.mjs";
 export { startStaticDevelopmentPreview } from "./preview/static-preview.mjs";
 export { createReviewSession, startReviewPanelServer } from "./review-panel/review-panel.mjs";
+export { createManagedAssetLibrary } from "./assets/managed-asset-library.mjs";
 
 export const BACKEND_STATUS = Object.freeze({
   phase: "static_web_workspace_preview",
@@ -31,5 +32,6 @@ export const BACKEND_STATUS = Object.freeze({
   workspace_authority_implemented: true,
   development_preview_implemented: true,
   preview_panel_implemented: true,
+  media_library_implemented: true,
   copied_private_source: false,
 });
