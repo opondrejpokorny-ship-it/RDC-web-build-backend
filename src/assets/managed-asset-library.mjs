@@ -1,6 +1,9 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+
+import { defaultProcessStartIdentity } from "../lifecycle/json-store.mjs";
 
 const STATE_VERSION = 1;
 const DEFAULT_MAX_ASSET_BYTES = 50 * 1024 * 1024;
@@ -12,10 +15,18 @@ const DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
 const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const EXTENSION_RE = /^[a-z0-9]{1,16}$/;
 const WINDOWS_RESERVED_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+const INTERNAL_ERRORS = new WeakSet();
+const PROJECT_CAPABILITIES = new Set(["asset_import", "asset_read"]);
+const DEFAULT_STALE_LOCK_MS = 30_000;
+const DEFAULT_LOCK_WAIT_MS = 5_000;
+const DEFAULT_LOCK_RETRY_MS = 10;
+const LOCK_OWNER_RE = /^owner-[a-f0-9-]{16,}\.json$/i;
+const CURRENT_PROCESS_START_IDENTITY = `self:${process.pid}:${Math.round(Date.now() - process.uptime() * 1000)}`;
 
 function safeError(code) {
   const error = new Error(code);
   error.code = code;
+  INTERNAL_ERRORS.add(error);
   return error;
 }
 
@@ -156,7 +167,7 @@ function sourceMetadataSnapshot(raw, maxAssetBytes) {
       is_reparse_point,
     });
   } catch (error) {
-    if (error?.code === "asset_source_invalid") throw error;
+    if (INTERNAL_ERRORS.has(error)) throw error;
     throw safeError("asset_source_failure");
   }
 }
@@ -314,6 +325,39 @@ function cloneAsset(asset) {
   });
 }
 
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    return true;
+  }
+}
+
+function parseLockOwner(raw) {
+  try {
+    const value = JSON.parse(String(raw ?? "").trim());
+    if (
+      isPlainObject(value)
+      && typeof value.owner_id === "string"
+      && /^[a-f0-9-]{16,}$/i.test(value.owner_id)
+      && Number.isInteger(value.pid)
+      && value.pid > 0
+      && typeof value.hostname === "string"
+      && value.hostname.length > 0
+      && typeof value.process_start_identity === "string"
+      && value.process_start_identity.length > 0
+      && Number.isFinite(value.created_at_ms)
+    ) {
+      return value;
+    }
+  } catch {}
+  return null;
+}
+
 function defaultIdFactory() {
   return "asset-" + crypto.randomBytes(24).toString("base64url");
 }
@@ -321,9 +365,11 @@ function defaultIdFactory() {
 export function createManagedAssetLibrary({
   rootDir,
   localSource,
+  projectAuthority,
   maxAssetBytes = DEFAULT_MAX_ASSET_BYTES,
   now = () => new Date().toISOString(),
   idFactory = defaultIdFactory,
+  lockOptions = {},
 }) {
   if (typeof rootDir !== "string" || rootDir.trim().length === 0) {
     throw new TypeError("asset_root_required");
@@ -335,18 +381,177 @@ export function createManagedAssetLibrary({
   ) {
     throw new TypeError("asset_local_source_required");
   }
+  if (!projectAuthority || typeof projectAuthority.authorizeProjectAccess !== "function") {
+    throw new TypeError("asset_project_authority_required");
+  }
   if (!Number.isSafeInteger(maxAssetBytes) || maxAssetBytes < 1 || maxAssetBytes > 1024 * 1024 * 1024) {
     throw new TypeError("asset_limit_invalid");
   }
   if (typeof now !== "function") throw new TypeError("asset_now_required");
   if (typeof idFactory !== "function") throw new TypeError("asset_id_factory_required");
+  if (!isPlainObject(lockOptions)) throw new TypeError("asset_lock_options_invalid");
+  const allowedLockOptionKeys = new Set(["staleLockMs", "waitMs", "retryMs", "nowMs", "hostname", "processStartIdentity"]);
+  if (Object.keys(lockOptions).some((key) => !allowedLockOptionKeys.has(key))) {
+    throw new TypeError("asset_lock_options_invalid");
+  }
+  const staleLockMs = lockOptions.staleLockMs ?? DEFAULT_STALE_LOCK_MS;
+  const lockWaitMs = lockOptions.waitMs ?? DEFAULT_LOCK_WAIT_MS;
+  const lockRetryMs = lockOptions.retryMs ?? DEFAULT_LOCK_RETRY_MS;
+  const lockNow = lockOptions.nowMs ?? (() => Date.now());
+  const lockHostname = lockOptions.hostname ?? os.hostname();
+  const processStartIdentity = lockOptions.processStartIdentity ?? defaultProcessStartIdentity;
+  if (!Number.isFinite(staleLockMs) || staleLockMs <= 0) throw new TypeError("asset_lock_options_invalid");
+  if (!Number.isFinite(lockWaitMs) || lockWaitMs < 0) throw new TypeError("asset_lock_options_invalid");
+  if (!Number.isFinite(lockRetryMs) || lockRetryMs <= 0) throw new TypeError("asset_lock_options_invalid");
+  if (typeof lockNow !== "function" || typeof processStartIdentity !== "function") throw new TypeError("asset_lock_options_invalid");
+  if (typeof lockHostname !== "string" || lockHostname.trim().length === 0) throw new TypeError("asset_lock_options_invalid");
 
   const root = path.resolve(rootDir);
   const statePath = path.join(root, "assets-index.json");
+  const lockPath = statePath + ".lock";
   const blobRoot = path.join(root, "blobs", "sha256");
   let queue = Promise.resolve();
 
   fs.mkdirSync(root, { recursive: true });
+
+  function readLockSnapshot() {
+    let stat;
+    try {
+      stat = fs.lstatSync(lockPath);
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    if (!stat.isDirectory()) {
+      return { kind: "unexpected", mtimeMs: stat.mtimeMs, entries: [], ownerFile: null, metadata: null, raw: null };
+    }
+
+    let entries;
+    try {
+      entries = fs.readdirSync(lockPath).sort();
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    const ownerFiles = entries.filter((entry) => LOCK_OWNER_RE.test(entry));
+    if (entries.length !== 1 || ownerFiles.length !== 1) {
+      return { kind: "directory", mtimeMs: stat.mtimeMs, entries, ownerFile: null, metadata: null, raw: null };
+    }
+
+    const ownerFile = ownerFiles[0];
+    try {
+      const ownerPath = path.join(lockPath, ownerFile);
+      const ownerStat = fs.statSync(ownerPath);
+      const raw = fs.readFileSync(ownerPath, "utf8");
+      return {
+        kind: "directory",
+        mtimeMs: Math.max(stat.mtimeMs, ownerStat.mtimeMs),
+        entries,
+        ownerFile,
+        metadata: parseLockOwner(raw),
+        raw,
+      };
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  function lockIsStale(snapshot) {
+    if (!snapshot) return true;
+    const filesystemAgeMs = Math.max(0, lockNow() - snapshot.mtimeMs);
+    if (snapshot.kind !== "directory" || !snapshot.metadata || !snapshot.ownerFile) {
+      return filesystemAgeMs >= staleLockMs;
+    }
+    const metadata = snapshot.metadata;
+    const ageMs = Math.max(0, lockNow() - metadata.created_at_ms);
+    if (metadata.hostname !== lockHostname) return false;
+    if (!processIsAlive(metadata.pid)) return true;
+    if (ageMs < staleLockMs) return false;
+    const currentIdentity = processStartIdentity(metadata.pid);
+    if (!currentIdentity) return false;
+    return currentIdentity !== metadata.process_start_identity;
+  }
+
+  function recoverStaleLock() {
+    const snapshot = readLockSnapshot();
+    if (!snapshot || !lockIsStale(snapshot) || snapshot.kind !== "directory") return false;
+    if (snapshot.ownerFile) {
+      const expectedOwnerPath = path.join(lockPath, snapshot.ownerFile);
+      try {
+        const currentRaw = fs.readFileSync(expectedOwnerPath, "utf8");
+        if (currentRaw !== snapshot.raw) return false;
+        fs.unlinkSync(expectedOwnerPath);
+      } catch (error) {
+        if (error?.code === "ENOENT") return false;
+        return false;
+      }
+    } else if (snapshot.entries.length !== 0) {
+      return false;
+    }
+    try {
+      fs.rmdirSync(lockPath);
+      return true;
+    } catch (error) {
+      if (error?.code === "ENOENT") return true;
+      return false;
+    }
+  }
+
+  function createMutationLock() {
+    const ownerId = crypto.randomUUID();
+    const metadata = {
+      owner_id: ownerId,
+      pid: process.pid,
+      hostname: lockHostname,
+      process_start_identity: processStartIdentity(process.pid) || CURRENT_PROCESS_START_IDENTITY,
+      created_at_ms: lockNow(),
+    };
+    const ownerFile = `owner-${ownerId}.json`;
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    const ownerPath = path.join(lockPath, ownerFile);
+    try {
+      const fd = fs.openSync(ownerPath, "wx", 0o600);
+      try {
+        fs.writeFileSync(fd, JSON.stringify(metadata) + "\n", "utf8");
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch (error) {
+      try { fs.rmdirSync(lockPath); } catch {}
+      throw error;
+    }
+    return { metadata, ownerFile };
+  }
+
+  async function acquireMutationLock() {
+    const startedAt = Date.now();
+    while (true) {
+      try {
+        return createMutationLock();
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        if (recoverStaleLock()) continue;
+        if (Date.now() - startedAt >= lockWaitMs) throw safeError("asset_store_busy");
+        await new Promise((resolve) => setTimeout(resolve, lockRetryMs));
+      }
+    }
+  }
+
+  function releaseMutationLock(lock) {
+    if (!lock) return;
+    const ownerPath = path.join(lockPath, lock.ownerFile);
+    try {
+      const raw = fs.readFileSync(ownerPath, "utf8");
+      const metadata = parseLockOwner(raw);
+      if (!metadata || metadata.owner_id !== lock.metadata.owner_id) return;
+      fs.unlinkSync(ownerPath);
+    } catch {
+      return;
+    }
+    try { fs.rmdirSync(lockPath); } catch {}
+  }
 
   function readState() {
     if (!fs.existsSync(statePath)) return defaultState();
@@ -418,6 +623,29 @@ export function createManagedAssetLibrary({
     queue = run.catch(() => {});
     return run;
   }
+  async function requireProject(projectId, capability) {
+    if (!PROJECT_CAPABILITIES.has(capability)) throw safeError("asset_project_capability_invalid");
+    let authorization;
+    try {
+      authorization = await projectAuthority.authorizeProjectAccess(Object.freeze({
+        project_id: projectId,
+        capability,
+      }));
+      if (
+        !isPlainObject(authorization)
+        || authorization.allowed !== true
+        || !isPlainObject(authorization.project)
+        || authorization.project.project_id !== projectId
+        || authorization.project.project_type !== "static_web"
+      ) {
+        throw safeError("asset_project_unavailable");
+      }
+    } catch (error) {
+      if (INTERNAL_ERRORS.has(error)) throw error;
+      throw safeError("asset_project_failure");
+    }
+  }
+
   async function safeStat(localFileId) {
     let raw;
     try {
@@ -446,7 +674,10 @@ export function createManagedAssetLibrary({
     const fingerprint = requestFingerprint(request);
 
     return withQueue(async () => {
-      const state = readState();
+      await requireProject(request.project_id, "asset_import");
+      const mutationLock = await acquireMutationLock();
+      try {
+        const state = readState();
       const prior = state.idempotency[request.idempotency_key];
       if (prior) {
         if (prior.fingerprint !== fingerprint) throw safeError("asset_idempotency_conflict");
@@ -501,6 +732,7 @@ export function createManagedAssetLibrary({
       };
       if (!validateStoredAsset(asset)) throw safeError("asset_store_invalid");
 
+      await requireProject(request.project_id, "asset_import");
       writeBlob(contentDigest, bytes);
 
       state.assets[assetId] = asset;
@@ -512,30 +744,40 @@ export function createManagedAssetLibrary({
       };
       writeState(state);
 
-      return Object.freeze({ ok: true, asset: cloneAsset(asset) });
+        return Object.freeze({ ok: true, asset: cloneAsset(asset) });
+      } finally {
+        releaseMutationLock(mutationLock);
+      }
     });
   }
 
-  function getAsset(projectId, assetId) {
-    if (!validProjectId(projectId) || typeof assetId !== "string" || !ASSET_ID_RE.test(assetId)) {
-      return null;
-    }
+  function lookupAsset(projectId, assetId) {
     const state = readState();
     const asset = state.assets[assetId];
     if (!asset || asset.project_id !== projectId) return null;
     return cloneAsset(asset);
   }
 
-  function listAssets(projectId) {
+  async function getAsset(projectId, assetId) {
+    if (!validProjectId(projectId) || typeof assetId !== "string" || !ASSET_ID_RE.test(assetId)) {
+      return null;
+    }
+    await requireProject(projectId, "asset_read");
+    return lookupAsset(projectId, assetId);
+  }
+
+  async function listAssets(projectId) {
     if (!validProjectId(projectId)) return Object.freeze([]);
+    await requireProject(projectId, "asset_read");
     const state = readState();
     const ids = state.projects[projectId] ?? [];
     return Object.freeze(ids.map((id) => cloneAsset(state.assets[id])));
   }
 
   async function readManagedAsset(projectId, assetId) {
-    const asset = getAsset(projectId, assetId);
+    const asset = await getAsset(projectId, assetId);
     if (!asset) throw safeError("asset_not_found");
+    await requireProject(projectId, "asset_read");
     const blobPath = blobPathForDigest(asset.content_digest);
     let bytes;
     try {
