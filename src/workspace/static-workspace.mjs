@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { defaultProcessStartIdentity } from "../lifecycle/json-store.mjs";
 
-export const STATIC_WORKSPACE_DIGEST_VERSION = "rdc-static-workspace-v1";
+export const STATIC_WORKSPACE_DIGEST_VERSION = "rdc-static-workspace-v2";
 
 const DEFAULT_LIMITS = Object.freeze({
   max_files: 1000,
@@ -54,9 +54,10 @@ function parseWorkspaceLockOwner(raw) {
 }
 
 const WINDOWS_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+const WINDOWS_ILLEGAL_SEGMENT_CHARS = /[<>:"|?*\u0000-\u001f]/u;
 
 function windowsUnsafeSegment(segment) {
-  return segment.includes(":")
+  return WINDOWS_ILLEGAL_SEGMENT_CHARS.test(segment)
     || segment.endsWith(".")
     || segment.endsWith(" ")
     || WINDOWS_RESERVED.test(segment);
@@ -71,6 +72,8 @@ function validProjectId(value) {
 
 function normalizeRelative(value) {
   if (typeof value !== "string" || value.length === 0 || value.length > 1024) fail("workspace_path_invalid");
+  if (!value.isWellFormed()) fail("workspace_path_invalid");
+  if (value.normalize("NFC") !== value) fail("workspace_path_invalid");
   if (value.includes("\\") || value.includes("\0") || path.isAbsolute(value) || /^[A-Za-z]:/.test(value)) {
     fail("workspace_path_invalid");
   }
@@ -81,6 +84,21 @@ function normalizeRelative(value) {
   if (normalized !== value) fail("workspace_path_invalid");
   if (normalized.split("/").some(windowsUnsafeSegment)) fail("workspace_path_invalid");
   return normalized;
+}
+
+function compareUtf8(left, right) {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function portablePathKey(value) {
+  return value.split("/").map((segment) => segment.toUpperCase().toLowerCase()).join("/");
+}
+
+function registerPortablePath(seen, relativePath) {
+  const key = portablePathKey(relativePath);
+  const prior = seen.get(key);
+  if (prior !== undefined && prior !== relativePath) fail("workspace_path_invalid");
+  seen.set(key, relativePath);
 }
 
 function sameFilesystemPath(left, right) {
@@ -145,23 +163,230 @@ function ensureContainedDirectory(root, directory) {
   return current;
 }
 
-function walkFiles(root, relative = "") {
+function trySyncDirectoryDurably(directoryPath) {
+  let fd;
+  try {
+    ensurePathEntrySafe(directoryPath);
+    if (!fs.lstatSync(directoryPath).isDirectory()) fail("workspace_durable_sync_failed");
+    fd = fs.openSync(directoryPath, process.platform === "win32" ? "r+" : "r");
+    fs.fsyncSync(fd);
+    return true;
+  } catch (error) {
+    if (
+      process.platform === "win32"
+      && (error?.code === "EPERM" || error?.code === "EACCES")
+    ) {
+      return false;
+    }
+    if (error?.code === "workspace_durable_sync_failed") throw error;
+    fail("workspace_durable_sync_failed");
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function syncDirectoryDurably(directoryPath) {
+  if (!trySyncDirectoryDurably(directoryPath)) {
+    fail("workspace_durable_sync_unsupported");
+  }
+}
+
+function ensureAbsoluteDirectoryDurably(directoryPath) {
+  const resolved = path.resolve(directoryPath);
+  const parsed = path.parse(resolved);
+  let current = parsed.root;
+  let durabilityStarted = false;
+  ensurePathEntrySafe(current);
+  const relative = path.relative(parsed.root, resolved);
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    const next = path.join(current, part);
+    const existed = fs.existsSync(next);
+    if (!existed) {
+      try {
+        fs.mkdirSync(next);
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+      }
+    }
+    ensurePathEntrySafe(next);
+    if (!fs.lstatSync(next).isDirectory()) fail("workspace_path_invalid");
+    if (!durabilityStarted) {
+      const supported = trySyncDirectoryDurably(current);
+      if (supported) {
+        durabilityStarted = true;
+      } else if (!existed) {
+        fail("workspace_durable_sync_unsupported");
+      }
+    } else {
+      syncDirectoryDurably(current);
+    }
+    current = next;
+  }
+  return resolved;
+}
+
+function syncDirectoryTree(root) {
+  ensurePathEntrySafe(root);
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const target = path.join(root, entry.name);
+    ensurePathEntrySafe(target);
+    if (entry.isSymbolicLink()) fail("workspace_symlink_forbidden");
+    if (entry.isDirectory()) syncDirectoryTree(target);
+    else if (!entry.isFile()) fail("workspace_special_file_forbidden");
+  }
+  syncDirectoryDurably(root);
+}
+
+function walkFiles(root, relative = "", portableSeen = new Map()) {
   ensureNoLinks(root, relative);
   const dir = relative ? path.join(root, ...relative.split("/")) : root;
   if (!fs.existsSync(dir)) return [];
-  const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+  const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => compareUtf8(a.name, b.name));
   const out = [];
   for (const entry of entries) {
     const rel = relative ? relative + "/" + entry.name : entry.name;
+    normalizeRelative(rel);
+    registerPortablePath(portableSeen, rel);
     ensureNoLinks(root, rel);
     if (entry.isSymbolicLink()) fail("workspace_symlink_forbidden");
-    if (entry.isDirectory()) out.push(...walkFiles(root, rel));
+    if (entry.isDirectory()) out.push(...walkFiles(root, rel, portableSeen));
     else if (entry.isFile()) out.push(rel);
     else fail("workspace_special_file_forbidden");
   }
   return out;
 }
 
+function captureVirtualTree(root, limits) {
+  const files = new Map();
+  const directories = new Set([""]);
+  const portableSeen = new Map();
+  let totalBytes = 0;
+
+  const visit = (relative = "") => {
+    ensureNoLinks(root, relative);
+    const directory = relative ? path.join(root, ...relative.split("/")) : root;
+    const entries = fs.readdirSync(directory, { withFileTypes: true })
+      .sort((a, b) => compareUtf8(a.name, b.name));
+    for (const entry of entries) {
+      const rel = relative ? relative + "/" + entry.name : entry.name;
+      normalizeRelative(rel);
+      registerPortablePath(portableSeen, rel);
+      ensureNoLinks(root, rel);
+      if (entry.isSymbolicLink()) fail("workspace_symlink_forbidden");
+      if (entry.isDirectory()) {
+        directories.add(rel);
+        visit(rel);
+        continue;
+      }
+      if (!entry.isFile()) fail("workspace_special_file_forbidden");
+      const bytes = Buffer.from(readRegularFileStable(root, rel));
+      if (bytes.length > limits.max_file_bytes) fail("workspace_limit_file_bytes");
+      totalBytes += bytes.length;
+      if (totalBytes > limits.max_total_bytes) fail("workspace_limit_total_bytes");
+      files.set(rel, bytes);
+      if (files.size > limits.max_files) fail("workspace_limit_files");
+    }
+  };
+
+  visit();
+  return { files, directories };
+}
+
+function compareWalkPaths(left, right) {
+  const a = left.split("/");
+  const b = right.split("/");
+  const length = Math.min(a.length, b.length);
+  for (let index = 0; index < length; index += 1) {
+    const compared = compareUtf8(a[index], b[index]);
+    if (compared !== 0) return compared;
+  }
+  return a.length - b.length;
+}
+
+function applyOperationsToVirtualTree(model, operations, limits) {
+  if (!Array.isArray(operations) || operations.length === 0) fail("workspace_change_invalid");
+  if (operations.length > limits.max_operations) fail("workspace_operation_limit");
+
+  const files = new Map(
+    Array.from(model.files, ([rel, bytes]) => [rel, Buffer.from(bytes)]),
+  );
+  const directories = new Set(model.directories);
+  const portableFiles = new Map();
+  const portableDirectories = new Map();
+  for (const rel of files.keys()) {
+    const key = portablePathKey(rel);
+    const prior = portableFiles.get(key);
+    if (prior !== undefined && prior !== rel) fail("workspace_operation_invalid");
+    portableFiles.set(key, rel);
+  }
+  for (const rel of directories) {
+    const key = portablePathKey(rel);
+    const prior = portableDirectories.get(key);
+    if (prior !== undefined && prior !== rel) fail("workspace_operation_invalid");
+    if (portableFiles.has(key)) fail("workspace_operation_invalid");
+    portableDirectories.set(key, rel);
+  }
+
+  for (const op of operations) {
+    if (!op || typeof op !== "object" || !["write", "delete"].includes(op.type)) {
+      fail("workspace_operation_invalid");
+    }
+    const rel = normalizeRelative(op.path);
+    const relKey = portablePathKey(rel);
+    const fileAlias = portableFiles.get(relKey);
+    const directoryAlias = portableDirectories.get(relKey);
+    if (fileAlias !== undefined && fileAlias !== rel) fail("workspace_operation_invalid");
+    if (directoryAlias !== undefined && directoryAlias !== rel) fail("workspace_operation_invalid");
+
+    const segments = rel.split("/");
+    const parents = [];
+    for (let index = 1; index < segments.length; index += 1) {
+      const parent = segments.slice(0, index).join("/");
+      const parentKey = portablePathKey(parent);
+      const parentFileAlias = portableFiles.get(parentKey);
+      const parentDirectoryAlias = portableDirectories.get(parentKey);
+      if (parentFileAlias !== undefined) fail("workspace_operation_invalid");
+      if (parentDirectoryAlias !== undefined && parentDirectoryAlias !== parent) {
+        fail("workspace_operation_invalid");
+      }
+      parents.push(parent);
+    }
+
+    if (op.type === "write") {
+      if (directories.has(rel)) fail("workspace_operation_invalid");
+      const bytes = Buffer.isBuffer(op.content)
+        ? Buffer.from(op.content)
+        : Buffer.from(String(op.content ?? ""));
+      if (bytes.length > limits.max_file_bytes) fail("workspace_limit_file_bytes");
+      for (const parent of parents) {
+        directories.add(parent);
+        portableDirectories.set(portablePathKey(parent), parent);
+      }
+      files.set(rel, bytes);
+      portableFiles.set(relKey, rel);
+    } else {
+      if (directories.has(rel)) fail("workspace_operation_invalid");
+      files.delete(rel);
+      if (fileAlias === rel) portableFiles.delete(relKey);
+    }
+  }
+
+  if (files.size > limits.max_files) fail("workspace_limit_files");
+  let totalBytes = 0;
+  const captured = Array.from(files, ([rel, bytes]) => ({
+    path: rel,
+    bytes: Buffer.from(bytes),
+  })).sort((a, b) => compareWalkPaths(a.path, b.path));
+  for (const entry of captured) {
+    totalBytes += entry.bytes.length;
+    if (totalBytes > limits.max_total_bytes) fail("workspace_limit_total_bytes");
+  }
+  return Object.freeze({
+    next_workspace_digest: digestCapturedEntries(captured),
+  });
+}
 function sameFileIdentity(left, right) {
   return left.isFile()
     && right.isFile()
@@ -251,6 +476,9 @@ function copyTreeVerified(source, destination, containmentRoot) {
     }
     ensureNoLinks(destination, rel);
   }
+  syncDirectoryTree(destination);
+  syncDirectoryDurably(path.dirname(destination));
+  syncDirectoryDurably(containmentRoot);
 }
 
 const SWAP_JOURNAL_VERSION = "rdc-static-workspace-swap-v1";
@@ -312,6 +540,7 @@ function durableWriteText(filePath, text, flag) {
   } finally {
     fs.closeSync(fd);
   }
+  syncDirectoryDurably(path.dirname(filePath));
 }
 
 export class StaticWorkspaceAuthority {
@@ -331,7 +560,7 @@ export class StaticWorkspaceAuthority {
     if (typeof processIsAlive !== "function") throw new TypeError("workspace_process_is_alive_required");
     const resolvedRoot = path.resolve(root);
     ensureAbsolutePathChainSafe(resolvedRoot);
-    fs.mkdirSync(resolvedRoot, { recursive: true });
+    ensureAbsoluteDirectoryDurably(resolvedRoot);
     ensureAbsolutePathChainSafe(resolvedRoot);
     ensurePathEntrySafe(resolvedRoot);
     this.root = fs.realpathSync.native(resolvedRoot);
@@ -400,6 +629,7 @@ export class StaticWorkspaceAuthority {
     const journalPath = path.join(projectRoot, SWAP_JOURNAL_BASENAME);
     ensureNoLinks(projectRoot, SWAP_JOURNAL_BASENAME);
     fs.unlinkSync(journalPath);
+    syncDirectoryDurably(projectRoot);
   }
 
   _cleanupSwapGarbageBestEffort(projectRoot, garbage) {
@@ -437,6 +667,7 @@ export class StaticWorkspaceAuthority {
     const renameAbsent = (source, destination) => {
       if (fs.existsSync(destination)) fail("workspace_swap_destination_exists");
       fs.renameSync(source, destination);
+      syncDirectoryDurably(projectRoot);
     };
 
     if (workingDigest === journal.old_digest && !oldDigest && newDigest === journal.new_digest && !garbageDigest) {
@@ -515,13 +746,16 @@ export class StaticWorkspaceAuthority {
 
     try {
       fs.renameSync(paths.working, paths.oldDir);
+      syncDirectoryDurably(projectRoot);
       fs.renameSync(paths.newDir, paths.working);
+      syncDirectoryDurably(projectRoot);
 
       if (digestTree(paths.working) !== new_digest || digestTree(paths.oldDir) !== old_digest) {
         fail("workspace_swap_digest_mismatch");
       }
 
       fs.renameSync(paths.oldDir, paths.garbage);
+      syncDirectoryDurably(projectRoot);
       this._removeSwapJournal(projectRoot);
       this._cleanupSwapGarbageBestEffort(projectRoot, paths.garbage);
       return Object.freeze({ workspace_digest: new_digest });
@@ -554,11 +788,11 @@ export class StaticWorkspaceAuthority {
   _ensureManagedProjectRoot(projectId) {
     ensurePathEntrySafe(this.root);
     const projectsRoot = path.join(this.root, "projects");
-    if (!fs.existsSync(projectsRoot)) fs.mkdirSync(projectsRoot);
+    ensureAbsoluteDirectoryDurably(projectsRoot);
     ensurePathEntrySafe(projectsRoot);
 
     const projectRoot = this.projectRoot(projectId);
-    if (!fs.existsSync(projectRoot)) fs.mkdirSync(projectRoot);
+    ensureAbsoluteDirectoryDurably(projectRoot);
     ensurePathEntrySafe(projectRoot);
     return projectRoot;
   }
@@ -643,11 +877,15 @@ export class StaticWorkspaceAuthority {
 
     for (let attempt = 0; attempt < WORKSPACE_LOCK_ACQUIRE_ATTEMPTS; attempt += 1) {
       const ownerId = crypto.randomUUID();
+      const processStartIdentity = this.processStartIdentity(process.pid);
+      if (typeof processStartIdentity !== "string" || processStartIdentity.length === 0) {
+        fail("workspace_process_identity_unavailable");
+      }
       const metadata = {
         owner_id: ownerId,
         pid: process.pid,
         hostname: this.hostname,
-        process_start_identity: this.processStartIdentity(process.pid) || `self:${process.pid}:unknown`,
+        process_start_identity: processStartIdentity,
         created_at_ms: this.now(),
       };
       const ownerRecord = `${JSON.stringify(metadata)}\n`;
@@ -748,15 +986,25 @@ export class StaticWorkspaceAuthority {
       const working = this.getWorkingDirectory(projectId);
       if (fs.existsSync(working)) fail("workspace_project_exists");
       if (!files || typeof files !== "object" || Array.isArray(files)) fail("workspace_change_invalid");
-      fs.mkdirSync(working, { recursive: true });
+      ensureAbsoluteDirectoryDurably(working);
       try {
+        const portableSeen = new Map();
         for (const [name, value] of Object.entries(files)) {
           const rel = normalizeRelative(name);
+          registerPortablePath(portableSeen, rel);
           const target = path.join(working, ...rel.split("/"));
-          fs.mkdirSync(path.dirname(target), { recursive: true });
-          fs.writeFileSync(target, Buffer.isBuffer(value) ? value : Buffer.from(String(value)));
+          ensureAbsoluteDirectoryDurably(path.dirname(target));
+          const fd = fs.openSync(target, "wx", 0o600);
+          try {
+            fs.writeFileSync(fd, Buffer.isBuffer(value) ? value : Buffer.from(String(value)));
+            fs.fsyncSync(fd);
+          } finally {
+            fs.closeSync(fd);
+          }
         }
         this.assertLimits(working);
+        syncDirectoryTree(working);
+        syncDirectoryDurably(this.projectRoot(projectId));
         return { workspace_digest: this.computeDigest(projectId) };
       } catch (error) {
         fs.rmSync(working, { recursive: true, force: true });
@@ -851,6 +1099,28 @@ export class StaticWorkspaceAuthority {
     return digestTree(working);
   }
 
+  planChange(projectId, { expected_workspace_digest, operations }) {
+    return this._withProjectMutationLock(projectId, () => {
+      const working = this.getWorkingDirectory(projectId);
+      if (!fs.existsSync(working)) fail("workspace_project_not_found");
+      ensurePathEntrySafe(working);
+
+      const model = captureVirtualTree(working, this.limits);
+      const baselineEntries = Array.from(model.files, ([rel, bytes]) => ({
+        path: rel,
+        bytes: Buffer.from(bytes),
+      })).sort((a, b) => compareWalkPaths(a.path, b.path));
+      const baselineDigest = digestCapturedEntries(baselineEntries);
+      if (baselineDigest !== expected_workspace_digest) fail("workspace_digest_mismatch");
+      if (digestTree(working) !== baselineDigest) fail("workspace_read_view_mismatch");
+
+      const planned = applyOperationsToVirtualTree(model, operations, this.limits);
+      return Object.freeze({
+        workspace_digest: baselineDigest,
+        next_workspace_digest: planned.next_workspace_digest,
+      });
+    });
+  }
   applyChange(projectId, { expected_workspace_digest, operations }) {
     return this._withProjectMutationLock(projectId, () => {
       const current = this.computeDigest(projectId);
@@ -887,6 +1157,8 @@ export class StaticWorkspaceAuthority {
           }
         }
         this.assertLimits(staging);
+        syncDirectoryTree(staging);
+        syncDirectoryDurably(projectRoot);
       } catch (error) {
         fs.rmSync(staging, { recursive: true, force: true });
         throw error;
@@ -922,7 +1194,11 @@ export class StaticWorkspaceAuthority {
       const metadataRelative = "snapshots/" + snapshotId + ".json";
       const metadataPath = path.join(projectRoot, ...metadataRelative.split("/"));
       ensureNoLinks(projectRoot, "snapshots");
-      fs.writeFileSync(metadataPath, JSON.stringify({ snapshot_id: snapshotId, digest }) + "\n", { flag: "wx" });
+      durableWriteText(
+        metadataPath,
+        JSON.stringify({ snapshot_id: snapshotId, digest }) + "\n",
+        "wx",
+      );
       ensureNoLinks(projectRoot, metadataRelative);
       return Object.freeze({ snapshot_id: snapshotId, digest });
     });

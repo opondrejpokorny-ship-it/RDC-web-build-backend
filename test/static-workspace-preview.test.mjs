@@ -995,10 +995,10 @@ test("workspace enforces project identifiers and mutation limits atomically", ()
   }
 });
 
-test("digest v1 has explicit framing and distinguishes binary, line endings, rename, empty and ambiguous layouts", () => {
+test("digest v2 has explicit framing and distinguishes binary, line endings, rename, empty and ambiguous layouts", () => {
   const tmp = tempRoot();
   try {
-    assert.equal(STATIC_WORKSPACE_DIGEST_VERSION, "rdc-static-workspace-v1");
+    assert.equal(STATIC_WORKSPACE_DIGEST_VERSION, "rdc-static-workspace-v2");
 
     function digest(name, files) {
       const workspace = new StaticWorkspaceAuthority(path.join(tmp.dir, name));
@@ -1461,6 +1461,133 @@ test("validation can consume one immutable read view without re-reading live wor
     });
     assert.equal(result.ok, true);
     assert.equal(result.workspace_digest, digest);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+
+test("workspace mutation does not acknowledge a failed directory flush", () => {
+  const tmp = tempRoot();
+  const originalFsync = fs.fsyncSync;
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir);
+    const baseline = workspace.initializeProject("site-1", {
+      "index.html": "<h1>A</h1>\n",
+    }).workspace_digest;
+    let injected = false;
+    fs.fsyncSync = (fd) => {
+      const stat = fs.fstatSync(fd);
+      if (!injected && stat.isDirectory()) {
+        injected = true;
+        const error = new Error("simulated-directory-flush-failure");
+        error.code = "EIO";
+        throw error;
+      }
+      return originalFsync(fd);
+    };
+    assert.throws(
+      () => workspace.applyChange("site-1", {
+        expected_workspace_digest: baseline,
+        operations: [{ type: "write", path: "index.html", content: "<h1>B</h1>\n" }],
+      }),
+      /workspace_durable_sync_failed/,
+    );
+    assert.equal(injected, true);
+    fs.fsyncSync = originalFsync;
+    assert.equal(workspace.computeDigest("site-1"), baseline);
+  } finally {
+    fs.fsyncSync = originalFsync;
+    tmp.cleanup();
+  }
+});
+
+
+test("workspace root creation does not acknowledge an unflushed ancestor directory entry", () => {
+  const tmp = tempRoot();
+  const originalOpen = fs.openSync;
+  const workspaceRoot = path.join(tmp.dir, "nested", "workspace");
+  let parentFlushAttempted = false;
+  try {
+    fs.openSync = (target, flags, ...rest) => {
+      if (
+        typeof target === "string"
+        && path.resolve(target) === path.resolve(tmp.dir)
+        && (flags === "r+" || flags === "r")
+      ) {
+        parentFlushAttempted = true;
+        const error = new Error("simulated-workspace-ancestor-flush-failure");
+        error.code = "EIO";
+        throw error;
+      }
+      return originalOpen(target, flags, ...rest);
+    };
+    assert.throws(
+      () => new StaticWorkspaceAuthority(workspaceRoot),
+      /workspace_durable_sync_failed/,
+    );
+    assert.equal(parentFlushAttempted, true);
+  } finally {
+    fs.openSync = originalOpen;
+    tmp.cleanup();
+  }
+});
+
+
+test("workspace root durability retry re-flushes an ancestor left behind by the failed attempt", () => {
+  const tmp = tempRoot();
+  const originalOpen = fs.openSync;
+  const workspaceRoot = path.join(tmp.dir, "nested", "workspace");
+  let failOnce = true;
+  let retryAncestorOpenCount = 0;
+  try {
+    fs.openSync = (target, flags, ...rest) => {
+      if (
+        typeof target === "string"
+        && path.resolve(target) === path.resolve(tmp.dir)
+        && (flags === "r+" || flags === "r")
+      ) {
+        if (failOnce) {
+          failOnce = false;
+          const error = new Error("simulated-workspace-ancestor-flush-failure");
+          error.code = "EIO";
+          throw error;
+        }
+        retryAncestorOpenCount += 1;
+      }
+      return originalOpen(target, flags, ...rest);
+    };
+    assert.throws(
+      () => new StaticWorkspaceAuthority(workspaceRoot),
+      /workspace_durable_sync_failed/,
+    );
+    assert.equal(fs.existsSync(path.join(tmp.dir, "nested")), true);
+
+    const workspace = new StaticWorkspaceAuthority(workspaceRoot);
+    assert.ok(workspace);
+    assert.ok(retryAncestorOpenCount >= 1);
+  } finally {
+    fs.openSync = originalOpen;
+    tmp.cleanup();
+  }
+});
+
+
+test("workspace lock acquisition fails closed when process-start identity is unavailable", () => {
+  const tmp = tempRoot();
+  try {
+    const workspace = new StaticWorkspaceAuthority(tmp.dir, {
+      hostname: "test-host",
+      processIsAlive: () => true,
+      processStartIdentity: () => null,
+    });
+    assert.throws(
+      () => workspace.initializeProject("site-1", { "index.html": "must-not-land" }),
+      /workspace_process_identity_unavailable/,
+    );
+    const projectRoot = workspace.projectRoot("site-1");
+    assert.equal(fs.existsSync(path.join(projectRoot, ".workspace.lock")), false);
+    assert.equal(fs.existsSync(path.join(projectRoot, "working")), false);
   } finally {
     tmp.cleanup();
   }

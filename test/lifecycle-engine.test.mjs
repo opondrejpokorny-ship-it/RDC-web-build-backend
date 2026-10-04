@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { JsonLifecycleStore } from "../src/lifecycle/json-store.mjs";
+import { JsonLifecycleStore, defaultProcessStartIdentity } from "../src/lifecycle/json-store.mjs";
 import { StaticLifecycleService } from "../src/lifecycle/service.mjs";
 
 const DIGEST_A = "a".repeat(64);
@@ -287,6 +287,257 @@ test("reject restores accepted baseline and preserves active release", async () 
     assert.equal(reject.state.current_workspace_digest, DIGEST_A);
     assert.equal(workspace.computeDigest("project-1"), DIGEST_A);
     assert.equal(reject.state.active_release_id, activeBefore);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("successful reject retry replays the completed result without restoring twice", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const service = createService(tmp.file, workspace, releases);
+
+    service.createProject({ project_id: "project-1", initial_workspace_digest: DIGEST_A });
+    service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    });
+    assert.equal((await service.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+
+    service.beginChange({ project_id: "project-1", operation_id: "operation-2" });
+    workspace.setDigest("project-1", DIGEST_B);
+    service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-2",
+      expected_workspace_digest: DIGEST_B,
+    });
+
+    let restoreCalls = 0;
+    const restoreAcceptedBaseline = workspace.restoreAcceptedBaseline.bind(workspace);
+    workspace.restoreAcceptedBaseline = (...args) => {
+      restoreCalls += 1;
+      return restoreAcceptedBaseline(...args);
+    };
+
+    const request = humanRequest({
+      operation_id: "operation-2",
+      operation_revision: "2",
+      expected_workspace_digest: DIGEST_B,
+      idempotency_key: "idem-reject-retry",
+      transition: "reject",
+      evidence: { authorization_id: "approval-reject-retry" },
+    });
+    const first = await service.executeHumanTransition({ transition: "reject", request });
+    assert.equal(first.ok, true);
+    assert.equal(first.state.active_operation_id, null);
+    assert.equal(first.state.active_operation_revision, null);
+    assert.equal(first.state.operation_identity_status, "none");
+    assert.equal(first.state.current_workspace_digest, DIGEST_A);
+    assert.equal(restoreCalls, 1);
+
+    const retry = await service.executeHumanTransition({ transition: "reject", request });
+    assert.equal(retry.ok, true);
+    assert.equal(retry.idempotent_replay, true);
+    assert.deepEqual(retry.state, first.state);
+    assert.equal(workspace.computeDigest("project-1"), DIGEST_A);
+    assert.equal(restoreCalls, 1);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("changed reject replay with the same idempotency key fails closed as an idempotency conflict", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const service = createService(tmp.file, workspace, releases);
+
+    service.createProject({ project_id: "project-1", initial_workspace_digest: DIGEST_A });
+    service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    });
+    assert.equal((await service.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+
+    service.beginChange({ project_id: "project-1", operation_id: "operation-2" });
+    workspace.setDigest("project-1", DIGEST_B);
+    service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-2",
+      expected_workspace_digest: DIGEST_B,
+    });
+
+    const base = {
+      operation_id: "operation-2",
+      operation_revision: "2",
+      expected_workspace_digest: DIGEST_B,
+      idempotency_key: "idem-reject-conflict",
+      transition: "reject",
+      evidence: { authorization_id: "approval-reject-conflict" },
+    };
+    assert.equal((await service.executeHumanTransition({
+      transition: "reject",
+      request: humanRequest(base),
+    })).ok, true);
+
+    for (const changed of [
+      { ...base, operation_id: "operation-other" },
+      { ...base, operation_revision: "3" },
+      { ...base, expected_workspace_digest: DIGEST_C },
+    ]) {
+      const conflict = await service.executeHumanTransition({
+        transition: "reject",
+        request: humanRequest(changed),
+      });
+      assert.equal(conflict.ok, false);
+      assert.equal(conflict.error_code, "idempotency_conflict");
+    }
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("concurrent exact reject retries converge after one restore", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+
+    let releaseVerifier;
+    let verifierCalls = 0;
+    const verifierGate = new Promise((resolve) => {
+      releaseVerifier = resolve;
+    });
+    const service = new StaticLifecycleService({
+      store: new JsonLifecycleStore(tmp.file),
+      workspaceAuthority: workspace,
+      releaseAuthority: releases,
+      verifyAuthorizationEvidence: async (evidence) => {
+        if (evidence.authorization_id === "approval-concurrent-reject") {
+          verifierCalls += 1;
+          if (verifierCalls === 2) releaseVerifier();
+          await verifierGate;
+        }
+        return evidence.proof === "trusted-test-proof";
+      },
+      now: () => NOW,
+    });
+
+    service.createProject({ project_id: "project-1", initial_workspace_digest: DIGEST_A });
+    service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    });
+    assert.equal((await service.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+
+    service.beginChange({ project_id: "project-1", operation_id: "operation-2" });
+    workspace.setDigest("project-1", DIGEST_B);
+    service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-2",
+      expected_workspace_digest: DIGEST_B,
+    });
+
+    let restoreCalls = 0;
+    const restoreAcceptedBaseline = workspace.restoreAcceptedBaseline.bind(workspace);
+    workspace.restoreAcceptedBaseline = (...args) => {
+      restoreCalls += 1;
+      return restoreAcceptedBaseline(...args);
+    };
+
+    const request = humanRequest({
+      operation_id: "operation-2",
+      operation_revision: "2",
+      expected_workspace_digest: DIGEST_B,
+      idempotency_key: "idem-concurrent-reject",
+      transition: "reject",
+      evidence: { authorization_id: "approval-concurrent-reject" },
+    });
+    const results = await Promise.all([
+      service.executeHumanTransition({ transition: "reject", request }),
+      service.executeHumanTransition({ transition: "reject", request }),
+    ]);
+
+    assert.equal(results.every((result) => result.ok), true);
+    assert.equal(results.filter((result) => result.idempotent_replay === true).length, 1);
+    assert.equal(restoreCalls, 1);
+    assert.equal(workspace.computeDigest("project-1"), DIGEST_A);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("concurrent exact release prepare retries invoke provider once and converge", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+
+    let lookupCalls = 0;
+    let prepareCalls = 0;
+    const releases = {
+      async getPreparedRelease() {
+        lookupCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return null;
+      },
+      async prepareRelease({ accepted_digest }) {
+        prepareCalls += 1;
+        return { release_id: "release-concurrent", source_digest: accepted_digest };
+      },
+      async getActivation() {
+        return null;
+      },
+      async activateRelease() {
+        throw new Error("unexpected_activate");
+      },
+    };
+    const service = createService(tmp.file, workspace, releases);
+
+    service.createProject({ project_id: "project-1", initial_workspace_digest: DIGEST_A });
+    service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    });
+    assert.equal((await service.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+
+    const request = humanRequest({
+      transition: "release_prepare",
+      operation_revision: "1",
+      idempotency_key: "idem-concurrent-release-prepare",
+      evidence: { authorization_id: "approval-concurrent-release-prepare" },
+    });
+    const results = await Promise.all([
+      service.executeHumanTransition({ transition: "release_prepare", request }),
+      service.executeHumanTransition({ transition: "release_prepare", request }),
+    ]);
+
+    assert.equal(prepareCalls, 1);
+    assert.equal(results.every((result) => result.ok), true);
+    assert.equal(results.filter((result) => result.idempotent_replay === true).length, 1);
+    assert.equal(service.getProject("project-1").workflow_state, "release_ready");
   } finally {
     tmp.cleanup();
   }
@@ -1746,6 +1997,1195 @@ test("numeric persisted operation revision state fails closed without coercion",
     });
     assert.equal(result.ok, false);
     assert.equal(result.error_code, "operation_revision_unavailable");
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+
+test("concurrent exact release activate retries invoke provider once and converge", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const prepared = new Map();
+    let activateCalls = 0;
+    let activationLookupCalls = 0;
+    const releases = {
+      async getPreparedRelease({ idempotency_key }) {
+        return prepared.get(idempotency_key) || null;
+      },
+      async prepareRelease({ accepted_digest, idempotency_key }) {
+        const result = { release_id: "release-concurrent-activate", source_digest: accepted_digest };
+        prepared.set(idempotency_key, result);
+        return result;
+      },
+      async getActivation() {
+        activationLookupCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return null;
+      },
+      async activateRelease({ release_id }) {
+        activateCalls += 1;
+        return { active_release_id: release_id };
+      },
+    };
+    const service = createService(tmp.file, workspace, releases);
+
+    service.createProject({ project_id: "project-1", initial_workspace_digest: DIGEST_A });
+    service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    });
+    assert.equal((await service.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+    assert.equal((await service.executeHumanTransition({
+      transition: "release_prepare",
+      request: humanRequest({
+        transition: "release_prepare",
+        operation_revision: "1",
+        idempotency_key: "idem-concurrent-activate-prepare",
+        evidence: { authorization_id: "approval-concurrent-activate-prepare" },
+      }),
+    })).ok, true);
+
+    const request = humanRequest({
+      transition: "release_activate",
+      operation_revision: "1",
+      idempotency_key: "idem-concurrent-release-activate",
+      evidence: { authorization_id: "approval-concurrent-release-activate" },
+    });
+    const results = await Promise.all([
+      service.executeHumanTransition({ transition: "release_activate", request }),
+      service.executeHumanTransition({ transition: "release_activate", request }),
+    ]);
+
+    assert.equal(activationLookupCalls, 1);
+    assert.equal(activateCalls, 1);
+    assert.equal(results.every((result) => result.ok), true);
+    assert.equal(results.filter((result) => result.idempotent_replay === true).length, 1);
+    assert.equal(service.getProject("project-1").workflow_state, "release_active");
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("external provider claim corruption fails closed and a dead same-host owner is recoverable", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const store = new JsonLifecycleStore(tmp.file);
+    let mode = "fail";
+    let lookupCalls = 0;
+    let prepareCalls = 0;
+    const releases = {
+      async getPreparedRelease() {
+        lookupCalls += 1;
+        if (mode === "fail") throw new Error("provider_unavailable");
+        return null;
+      },
+      async prepareRelease({ accepted_digest }) {
+        prepareCalls += 1;
+        return { release_id: "release-dead-claim", source_digest: accepted_digest };
+      },
+      async getActivation() {
+        return null;
+      },
+      async activateRelease() {
+        throw new Error("unexpected_activate");
+      },
+    };
+    const service = new StaticLifecycleService({
+      store,
+      workspaceAuthority: workspace,
+      releaseAuthority: releases,
+      verifyAuthorizationEvidence: async (evidence) => evidence.proof === "trusted-test-proof",
+      now: () => NOW,
+    });
+
+    service.createProject({ project_id: "project-1", initial_workspace_digest: DIGEST_A });
+    service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    });
+    assert.equal((await service.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+
+    const request = humanRequest({
+      transition: "release_prepare",
+      operation_revision: "1",
+      idempotency_key: "idem-dead-provider-claim",
+      evidence: { authorization_id: "approval-dead-provider-claim" },
+    });
+    const providerFailure = await service.executeHumanTransition({
+      transition: "release_prepare",
+      request,
+    });
+    assert.equal(providerFailure.ok, false);
+    assert.equal(providerFailure.error_code, "release_authority_error");
+    assert.equal(store.read().projects["project-1"].pending_external_operation.provider_claim, null);
+
+    store.transact((state) => {
+      state.projects["project-1"].pending_external_operation.provider_claim = {
+        owner_id: "11111111-1111-4111-8111-111111111111",
+      };
+      return { ok: true };
+    });
+    const corrupt = await service.executeHumanTransition({
+      transition: "release_prepare",
+      request,
+    });
+    assert.equal(corrupt.ok, false);
+    assert.equal(corrupt.error_code, "external_provider_claim_invalid");
+    assert.equal(lookupCalls, 1);
+    assert.equal(prepareCalls, 0);
+
+    store.transact((state) => {
+      state.projects["project-1"].pending_external_operation.provider_claim = {
+        owner_id: "22222222-2222-4222-8222-222222222222",
+        pid: 2147483000,
+        hostname: os.hostname(),
+        process_start_identity: "dead-process-incarnation",
+        created_at_ms: Date.now(),
+      };
+      return { ok: true };
+    });
+    mode = "success";
+    const recovered = await service.executeHumanTransition({
+      transition: "release_prepare",
+      request,
+    });
+    assert.equal(recovered.ok, true);
+    assert.equal(prepareCalls, 1);
+    assert.equal(service.getProject("project-1").workflow_state, "release_ready");
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("provider failure retries owned-claim cleanup before returning while the owner PID stays live", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const durableStore = new JsonLifecycleStore(tmp.file);
+    let failCleanupOnce = false;
+    const store = {
+      read: (...args) => durableStore.read(...args),
+      transact(mutator) {
+        if (failCleanupOnce) {
+          const state = durableStore.read();
+          const claim = state.projects["project-1"]?.pending_external_operation?.provider_claim;
+          if (claim?.pid === process.pid) {
+            failCleanupOnce = false;
+            const busy = new Error("lifecycle_store_busy");
+            busy.code = "LIFECYCLE_STORE_BUSY";
+            throw busy;
+          }
+        }
+        return durableStore.transact(mutator);
+      },
+    };
+
+    let providerMode = "fail";
+    let prepareCalls = 0;
+    const releases = {
+      async getPreparedRelease() {
+        if (providerMode === "fail") {
+          failCleanupOnce = true;
+          throw new Error("provider_unavailable");
+        }
+        return null;
+      },
+      async prepareRelease({ accepted_digest }) {
+        prepareCalls += 1;
+        return { release_id: "release-cleanup-recovery", source_digest: accepted_digest };
+      },
+      async getActivation() {
+        return null;
+      },
+      async activateRelease() {
+        throw new Error("unexpected_activate");
+      },
+    };
+    const service = new StaticLifecycleService({
+      store,
+      workspaceAuthority: workspace,
+      releaseAuthority: releases,
+      verifyAuthorizationEvidence: async (evidence) => evidence.proof === "trusted-test-proof",
+      now: () => NOW,
+    });
+
+    service.createProject({ project_id: "project-1", initial_workspace_digest: DIGEST_A });
+    service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    });
+    assert.equal((await service.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+
+    const request = humanRequest({
+      transition: "release_prepare",
+      operation_revision: "1",
+      idempotency_key: "idem-cleanup-recovery",
+      evidence: { authorization_id: "approval-cleanup-recovery" },
+    });
+    const failed = await service.executeHumanTransition({
+      transition: "release_prepare",
+      request,
+    });
+    assert.equal(failed.ok, false);
+    assert.equal(failed.error_code, "release_authority_error");
+    assert.equal(
+      durableStore.read().projects["project-1"].pending_external_operation.provider_claim,
+      null,
+    );
+
+    providerMode = "success";
+    const retry = await service.executeHumanTransition({
+      transition: "release_prepare",
+      request,
+    });
+    assert.equal(retry.ok, true);
+    assert.equal(prepareCalls, 1);
+    assert.equal(service.getProject("project-1").workflow_state, "release_ready");
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("malformed consumed-authorization ledger fails closed without repair or mutation", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const store = new JsonLifecycleStore(tmp.file);
+    const service = new StaticLifecycleService({
+      store,
+      workspaceAuthority: workspace,
+      releaseAuthority: releases,
+      verifyAuthorizationEvidence: async (evidence) => evidence.proof === "trusted-test-proof",
+      now: () => NOW,
+    });
+
+    service.createProject({ project_id: "project-1", initial_workspace_digest: DIGEST_A });
+    service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    });
+    assert.equal((await service.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+
+    store.transact((state) => {
+      state.projects["project-1"].consumed_authorization_ids = "corrupt-ledger";
+      return { ok: true };
+    });
+    const before = store.read().projects["project-1"];
+    const denied = service.beginChange({
+      project_id: "project-1",
+      operation_id: "operation-2",
+    });
+    assert.deepEqual(denied, { ok: false, error_code: "lifecycle_state_invalid" });
+    const after = store.read().projects["project-1"];
+    assert.equal(after.consumed_authorization_ids, "corrupt-ledger");
+    assert.equal(after.workflow_state, before.workflow_state);
+    assert.equal(after.active_operation_id, before.active_operation_id);
+    assert.equal(after.active_operation_revision, before.active_operation_revision);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("malformed idempotency-result ledger fails closed without repair or mutation", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const store = new JsonLifecycleStore(tmp.file);
+    const service = new StaticLifecycleService({
+      store,
+      workspaceAuthority: workspace,
+      releaseAuthority: releases,
+      verifyAuthorizationEvidence: async (evidence) => evidence.proof === "trusted-test-proof",
+      now: () => NOW,
+    });
+
+    service.createProject({ project_id: "project-1", initial_workspace_digest: DIGEST_A });
+    service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    });
+    assert.equal((await service.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+
+    store.transact((state) => {
+      state.projects["project-1"].idempotency_results = [];
+      return { ok: true };
+    });
+    const before = store.read().projects["project-1"];
+    const denied = service.beginChange({
+      project_id: "project-1",
+      operation_id: "operation-2",
+    });
+    assert.deepEqual(denied, { ok: false, error_code: "lifecycle_state_invalid" });
+    const after = store.read().projects["project-1"];
+    assert.deepEqual(after.idempotency_results, []);
+    assert.equal(after.workflow_state, before.workflow_state);
+    assert.equal(after.active_operation_id, before.active_operation_id);
+    assert.equal(after.active_operation_revision, before.active_operation_revision);
+  } finally {
+    tmp.cleanup();
+  }
+});
+test("malformed pending prepared-change ledger fails closed across lifecycle entry points", () => {
+  for (const corrupt of [false, 0, "", {}]) {
+    for (const action of ["begin", "review", "reserve"]) {
+      const tmp = tempStore();
+      try {
+        const workspace = createWorkspaceAuthority();
+        const releases = createReleaseAuthority();
+        workspace.setDigest("project-1", DIGEST_A);
+        const store = new JsonLifecycleStore(tmp.file);
+        const service = createService(tmp.file, workspace, releases);
+        assert.equal(service.createProject({
+          project_id: "project-1",
+          initial_workspace_digest: DIGEST_A,
+        }).ok, true);
+        store.transact((state) => {
+          state.projects["project-1"].pending_prepared_change_application = corrupt;
+          return { ok: true };
+        });
+        let result;
+        if (action === "begin") {
+          result = service.beginChange({ project_id: "project-1", operation_id: "operation-1" });
+        } else if (action === "review") {
+          result = service.submitReview({
+            project_id: "project-1",
+            operation_id: "operation-1",
+            expected_workspace_digest: DIGEST_A,
+          });
+        } else {
+          result = service.reservePreparedChangeApply({
+            project_id: "project-1",
+
+            prepared_change_id: "change-1",
+            operation_id: "operation-1",
+            baseline_workspace_digest: DIGEST_A,
+            target_workspace_digest: DIGEST_B,
+            plan_digest: "d".repeat(64),
+          });
+        }
+        assert.deepEqual(result, { ok: false, error_code: "lifecycle_state_invalid" });
+        assert.deepEqual(
+          store.read().projects["project-1"].pending_prepared_change_application,
+          corrupt,
+        );
+      } finally {
+        tmp.cleanup();
+      }
+    }
+  }
+});
+
+test("malformed pending ledgers cannot be bypassed by human accept or release prepare", async () => {
+  for (const field of ["pending_prepared_change_application", "pending_external_operation"]) {
+    for (const corrupt of [false, 0, "", {}]) {
+      const tmp = tempStore();
+      try {
+        const workspace = createWorkspaceAuthority();
+        const releases = createReleaseAuthority();
+        workspace.setDigest("project-1", DIGEST_A);
+        const store = new JsonLifecycleStore(tmp.file);
+        const service = createService(tmp.file, workspace, releases);
+        assert.equal(service.createProject({
+          project_id: "project-1",
+          initial_workspace_digest: DIGEST_A,
+        }).ok, true);
+        assert.equal(service.submitReview({
+          project_id: "project-1",
+          operation_id: "operation-1",
+          expected_workspace_digest: DIGEST_A,
+        }).ok, true);
+
+        if (field === "pending_external_operation") {
+          assert.equal((await service.executeHumanTransition({
+            transition: "accept",
+            request: humanRequest(),
+          })).ok, true);
+        }
+
+        store.transact((state) => {
+          state.projects["project-1"][field] = corrupt;
+          return { ok: true };
+        });
+
+        const result = field === "pending_prepared_change_application"
+          ? await service.executeHumanTransition({
+              transition: "accept",
+              request: humanRequest({
+                idempotency_key: "idem-malformed-pending-accept",
+                evidence: { authorization_id: "approval-malformed-pending-accept" },
+              }),
+            })
+          : await service.executeHumanTransition({
+              transition: "release_prepare",
+              request: humanRequest({
+                transition: "release_prepare",
+                idempotency_key: "idem-malformed-pending-release",
+                evidence: { authorization_id: "approval-malformed-pending-release" },
+              }),
+            });
+        assert.deepEqual(result, { ok: false, error_code: "lifecycle_state_invalid" });
+        assert.deepEqual(store.read().projects["project-1"][field], corrupt);
+      } finally {
+        tmp.cleanup();
+      }
+    }
+  }
+});
+
+test("lifecycle project map treats prototype names as data keys, never inherited projects", () => {
+  const tmp = tempStore();
+  const pollutedFields = [
+    "consumed_authorization_ids", "idempotency_results",
+    "pending_external_operation", "pending_prepared_change_application",
+  ];
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("constructor", DIGEST_A);
+    workspace.setDigest("__proto__", DIGEST_B);
+    const service = createService(tmp.file, workspace, releases);
+
+    assert.equal(service.getProject("constructor"), null);
+    assert.deepEqual(
+      service.beginChange({ project_id: "constructor", operation_id: "operation-x" }),
+      { ok: false, error_code: "project_not_found" },
+    );
+    assert.deepEqual(
+      service.beginChange({ project_id: "__proto__", operation_id: "operation-y" }),
+      { ok: false, error_code: "project_not_found" },
+    );
+    assert.equal(service.createProject({
+      project_id: "constructor",
+      initial_workspace_digest: DIGEST_A,
+    }).ok, true);
+    assert.equal(service.createProject({
+      project_id: "__proto__",
+      initial_workspace_digest: DIGEST_B,
+    }).ok, true);
+    assert.equal(service.getProject("constructor").project_id, "constructor");
+    assert.equal(service.getProject("__proto__").project_id, "__proto__");
+
+    const raw = new JsonLifecycleStore(tmp.file).read();
+    assert.equal(Object.hasOwn(raw.projects, "constructor"), true);
+    assert.equal(Object.hasOwn(raw.projects, "__proto__"), true);
+  } finally {
+    for (const field of pollutedFields) {
+      delete Object[field];
+      delete Object.prototype[field];
+    }
+    tmp.cleanup();
+  }
+});
+
+test("reject retry recovers when workspace restore succeeded but lifecycle write was lost", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    const store = new JsonLifecycleStore(tmp.file);
+    workspace.setDigest("project-1", DIGEST_A);
+    const service = new StaticLifecycleService({
+      store,
+      workspaceAuthority: workspace,
+      releaseAuthority: releases,
+      verifyAuthorizationEvidence: async (evidence) => evidence.proof === "trusted-test-proof",
+      now: () => NOW,
+    });
+
+    assert.equal(service.createProject({
+      project_id: "project-1",
+      initial_workspace_digest: DIGEST_A,
+    }).ok, true);
+    assert.equal(service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    }).ok, true);
+    assert.equal((await service.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+
+    assert.equal(service.beginChange({
+      project_id: "project-1",
+      operation_id: "operation-2",
+    }).ok, true);
+    workspace.setDigest("project-1", DIGEST_B);
+    assert.equal(service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-2",
+      expected_workspace_digest: DIGEST_B,
+    }).ok, true);
+
+    const reviewed = service.getProject("project-1");
+    const request = humanRequest({
+      operation_id: "operation-2",
+      operation_revision: reviewed.active_operation_revision,
+      expected_workspace_digest: DIGEST_B,
+      idempotency_key: "idem-reject-lost-write",
+      transition: "reject",
+      evidence: { authorization_id: "approval-reject-lost-write" },
+    });
+    const originalWriteAtomic = store.writeAtomic.bind(store);
+    let injected = false;
+    store.writeAtomic = (state) => {
+      if (!injected) {
+        injected = true;
+        throw new Error("injected_lifecycle_write_failure");
+      }
+      return originalWriteAtomic(state);
+    };
+
+    await assert.rejects(
+      () => service.executeHumanTransition({ transition: "reject", request }),
+      /injected_lifecycle_write_failure/,
+    );
+    assert.equal(workspace.computeDigest("project-1"), DIGEST_A);
+    assert.equal(service.getProject("project-1").workflow_state, "review_required");
+    store.writeAtomic = originalWriteAtomic;
+
+    const retry = await service.executeHumanTransition({ transition: "reject", request });
+    assert.equal(retry.ok, true);
+    assert.equal(retry.state.workflow_state, "working");
+    assert.equal(retry.state.current_workspace_digest, DIGEST_A);
+    assert.equal(retry.state.operation_identity_status, "none");
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("lifecycle replay ledgers fail closed at bounded capacity before side effects", async () => {
+  for (const fullLedger of ["authorization", "idempotency"]) {
+    const tmp = tempStore();
+    try {
+      const workspace = createWorkspaceAuthority();
+      const releases = createReleaseAuthority();
+      const store = new JsonLifecycleStore(tmp.file);
+      workspace.setDigest("project-1", DIGEST_A);
+      const service = new StaticLifecycleService({
+        store,
+        workspaceAuthority: workspace,
+        releaseAuthority: releases,
+        verifyAuthorizationEvidence: async (evidence) => evidence.proof === "trusted-test-proof",
+        now: () => NOW,
+      });
+      assert.equal(service.createProject({
+        project_id: "project-1",
+        initial_workspace_digest: DIGEST_A,
+      }).ok, true);
+      assert.equal(service.submitReview({
+        project_id: "project-1",
+        operation_id: "operation-1",
+        expected_workspace_digest: DIGEST_A,
+      }).ok, true);
+      store.transact((state) => {
+        const project = state.projects["project-1"];
+        if (fullLedger === "authorization") {
+          project.consumed_authorization_ids = Array.from(
+            { length: 1024 },
+            (_, index) => "approval-cap-" + index,
+          );
+        } else {
+          project.consumed_authorization_ids = Array.from(
+            { length: 1024 },
+            (_, index) => "approval-cap-" + index,
+          );
+          project.idempotency_results = Object.fromEntries(
+            Array.from({ length: 1024 }, (_, index) => [
+              "idem-cap-" + index,
+              {
+                fingerprint: "f".repeat(64),
+                result: {
+                  ok: true,
+                  transition: "accept",
+                  authorization_id: "approval-cap-" + index,
+                  state: {
+                    project_id: "project-1",
+                    project_type: "static_web",
+                    workflow_state: "accepted",
+                    current_workspace_digest: DIGEST_A,
+                    accepted_workspace_digest: DIGEST_A,
+                    accepted_snapshot_id: "snapshot-cap",
+                    active_operation_id: "operation-cap",
+                    active_operation_revision: "1",
+                    operation_identity_status: "bound",
+                    ready_release_id: null,
+                    active_release_id: null,
+                    pending_external_transition: null,
+                  },
+                },
+              },
+            ]),
+          );
+        }
+        return { ok: true };
+      });
+
+      const result = await service.executeHumanTransition({
+        transition: "accept",
+        request: humanRequest({
+          idempotency_key: "idem-cap-new-" + fullLedger,
+          evidence: { authorization_id: "approval-cap-new-" + fullLedger },
+        }),
+      });
+      assert.deepEqual(result, { ok: false, error_code: "lifecycle_capacity" });
+      const after = service.getProject("project-1");
+      assert.equal(after.workflow_state, "review_required");
+      assert.equal(after.accepted_snapshot_id, null);
+      assert.equal(workspace.computeDigest("project-1"), DIGEST_A);
+    } finally {
+      tmp.cleanup();
+    }
+  }
+});
+
+test("prototype-sensitive idempotency keys remain durable own ledger entries", async () => {
+  for (const idempotencyKey of ["__proto__", "constructor", "toString"]) {
+    const tmp = tempStore();
+    try {
+      const workspace = createWorkspaceAuthority();
+      const releases = createReleaseAuthority();
+      workspace.setDigest("project-1", DIGEST_A);
+      const service = createService(tmp.file, workspace, releases);
+      assert.equal(service.createProject({
+        project_id: "project-1",
+        initial_workspace_digest: DIGEST_A,
+      }).ok, true);
+      assert.equal(service.submitReview({
+        project_id: "project-1",
+        operation_id: "operation-1",
+        expected_workspace_digest: DIGEST_A,
+      }).ok, true);
+
+      const request = humanRequest({
+        idempotency_key: idempotencyKey,
+        evidence: { authorization_id: "approval-" + idempotencyKey },
+      });
+      const first = await service.executeHumanTransition({ transition: "accept", request });
+      assert.equal(first.ok, true);
+      const raw = new JsonLifecycleStore(tmp.file).read();
+      assert.equal(Object.hasOwn(raw.projects["project-1"].idempotency_results, idempotencyKey), true);
+
+      const restarted = createService(tmp.file, workspace, releases);
+      const retry = await restarted.executeHumanTransition({ transition: "accept", request });
+      assert.equal(retry.ok, true);
+      assert.equal(retry.idempotent_replay, true);
+      assert.deepEqual(retry.state, first.state);
+    } finally {
+      tmp.cleanup();
+    }
+  }
+});
+
+test("malformed persisted idempotency result fails closed before replay", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const service = createService(tmp.file, workspace, releases);
+    assert.equal(service.createProject({
+      project_id: "project-1",
+      initial_workspace_digest: DIGEST_A,
+    }).ok, true);
+    assert.equal(service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    }).ok, true);
+    const request = humanRequest({ idempotency_key: "idem-malformed-replay" });
+    assert.equal((await service.executeHumanTransition({
+      transition: "accept",
+      request,
+    })).ok, true);
+
+    const store = new JsonLifecycleStore(tmp.file);
+    store.transact((state) => {
+      state.projects["project-1"].idempotency_results["idem-malformed-replay"].result = {
+        ok: true,
+        transition: "accept",
+        authorization_id: "forged",
+        state: { project_id: "project-1" },
+      };
+      return { ok: true };
+    });
+
+    assert.deepEqual(
+      await service.executeHumanTransition({ transition: "accept", request }),
+      { ok: false, error_code: "lifecycle_state_invalid" },
+    );
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+
+test("missing replay ledgers fail closed instead of resetting completed security history", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const store = new JsonLifecycleStore(tmp.file);
+    const service = createService(tmp.file, workspace, releases);
+    assert.equal(service.createProject({
+      project_id: "project-1",
+      initial_workspace_digest: DIGEST_A,
+    }).ok, true);
+    assert.equal(service.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    }).ok, true);
+    assert.equal((await service.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+    store.transact((state) => {
+      delete state.projects["project-1"].consumed_authorization_ids;
+      delete state.projects["project-1"].idempotency_results;
+      return { ok: true };
+    });
+    const before = store.read().projects["project-1"];
+    assert.deepEqual(service.beginChange({
+      project_id: "project-1",
+      operation_id: "operation-2",
+    }), { ok: false, error_code: "lifecycle_state_invalid" });
+    const after = store.read().projects["project-1"];
+    assert.deepEqual(after, before);
+    assert.equal(Object.hasOwn(after, "consumed_authorization_ids"), false);
+    assert.equal(Object.hasOwn(after, "idempotency_results"), false);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("provider claim detects same-host PID reuse via process-start identity", () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const service = createService(tmp.file, workspace, releases);
+    assert.equal(service.externalProviderClaimRecoverable({
+      owner_id: "33333333-3333-4333-8333-333333333333",
+      pid: process.pid,
+      hostname: os.hostname(),
+      process_start_identity: "stale-process-incarnation",
+      created_at_ms: Date.now(),
+    }), true);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("process-start identity is stable across same-host processes for the same live PID", async () => {
+  const selfIdentity = defaultProcessStartIdentity(process.pid);
+  assert.ok(selfIdentity);
+  const moduleUrl = new URL("../src/lifecycle/json-store.mjs", import.meta.url).href;
+  const childCode = [
+    "import { defaultProcessStartIdentity } from " + JSON.stringify(moduleUrl) + ";",
+    "process.stdout.write(String(defaultProcessStartIdentity(Number(process.argv[1])) || ''));",
+  ].join("\n");
+  const child = spawn(process.execPath, [
+    "--input-type=module",
+    "-e",
+    childCode,
+    String(process.pid),
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (value) => { stdout += value; });
+  child.stderr.on("data", (value) => { stderr += value; });
+  const exitCode = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
+  assert.equal(exitCode, 0, stderr);
+  assert.equal(stdout, selfIdentity);
+});
+
+
+test("lifecycle atomic commit does not acknowledge a failed parent-directory flush", () => {
+  const tmp = tempStore();
+  const originalFsync = fs.fsyncSync;
+  let injected = false;
+  try {
+    fs.fsyncSync = (fd) => {
+      const stat = fs.fstatSync(fd);
+      if (!injected && stat.isDirectory()) {
+        injected = true;
+        const error = new Error("simulated-directory-flush-failure");
+        error.code = "EIO";
+        throw error;
+      }
+      return originalFsync(fd);
+    };
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const service = createService(tmp.file, workspace, releases);
+    assert.throws(
+      () => service.createProject({
+        project_id: "project-1",
+        initial_workspace_digest: DIGEST_A,
+      }),
+      /lifecycle_directory_sync_failed/,
+    );
+    assert.equal(injected, true);
+  } finally {
+    fs.fsyncSync = originalFsync;
+    tmp.cleanup();
+  }
+});
+
+
+test("missing pending external field after provider side effect fails closed before any second provider call", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const normal = createService(tmp.file, workspace, releases);
+    assert.equal(normal.createProject({
+      project_id: "project-1",
+      initial_workspace_digest: DIGEST_A,
+    }).ok, true);
+    assert.equal(normal.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    }).ok, true);
+    assert.equal((await normal.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+
+    const firstRequest = humanRequest({
+      transition: "release_prepare",
+      idempotency_key: "missing-pending-first",
+      evidence: { authorization_id: "approval-missing-pending-first" },
+    });
+    const crashing = createService(tmp.file, workspace, releases, {
+      afterExternalAction: async ({ transition }) => {
+        if (transition === "release_prepare") throw new Error("simulated_crash_missing_pending");
+      },
+    });
+    await assert.rejects(
+      () => crashing.executeHumanTransition({
+        transition: "release_prepare",
+        request: firstRequest,
+      }),
+      /simulated_crash_missing_pending/,
+    );
+    assert.equal(releases.prepareCalls, 1);
+
+    const store = new JsonLifecycleStore(tmp.file);
+    store.transact((state) => {
+      delete state.projects["project-1"].pending_external_operation;
+      return { ok: true };
+    });
+
+    const secondRequest = humanRequest({
+      transition: "release_prepare",
+      idempotency_key: "missing-pending-second",
+      evidence: { authorization_id: "approval-missing-pending-second" },
+    });
+    const result = await normal.executeHumanTransition({
+      transition: "release_prepare",
+      request: secondRequest,
+    });
+    assert.deepEqual(result, { ok: false, error_code: "lifecycle_state_invalid" });
+    assert.equal(releases.prepareCalls, 1);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+
+test("lifecycle initialization does not acknowledge unflushed newly-created ancestor directories", () => {
+  const tmp = tempStore();
+  const originalOpen = fs.openSync;
+  const nestedFile = path.join(tmp.dir, "nested", "deeper", "state.json");
+  let parentFlushAttempted = false;
+  try {
+    fs.openSync = (target, flags, ...rest) => {
+      if (
+        typeof target === "string"
+        && path.resolve(target) === path.resolve(tmp.dir)
+        && (flags === "r+" || flags === "r")
+      ) {
+        parentFlushAttempted = true;
+        const error = new Error("simulated-ancestor-directory-flush-failure");
+        error.code = "EIO";
+        throw error;
+      }
+      return originalOpen(target, flags, ...rest);
+    };
+    const store = new JsonLifecycleStore(nestedFile);
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const service = new StaticLifecycleService({
+      store,
+      workspaceAuthority: workspace,
+      releaseAuthority: releases,
+      verifyAuthorizationEvidence: async () => true,
+    });
+    assert.throws(
+      () => service.createProject({
+        project_id: "project-1",
+        initial_workspace_digest: DIGEST_A,
+      }),
+      /lifecycle_directory_sync_failed/,
+    );
+    assert.equal(parentFlushAttempted, true);
+  } finally {
+    fs.openSync = originalOpen;
+    tmp.cleanup();
+  }
+});
+
+
+test("release prepare retry cannot resume a corrupted pending activate transition", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const normal = createService(tmp.file, workspace, releases);
+    assert.equal(normal.createProject({
+      project_id: "project-1",
+      initial_workspace_digest: DIGEST_A,
+    }).ok, true);
+    assert.equal(normal.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    }).ok, true);
+    assert.equal((await normal.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+
+    const request = humanRequest({
+      transition: "release_prepare",
+      idempotency_key: "pending-transition-substitution",
+      evidence: { authorization_id: "approval-pending-transition-substitution" },
+    });
+    const crashing = createService(tmp.file, workspace, releases, {
+      afterExternalAction: async ({ transition }) => {
+        if (transition === "release_prepare") throw new Error("simulated_crash_before_finalize");
+      },
+    });
+    await assert.rejects(
+      () => crashing.executeHumanTransition({ transition: "release_prepare", request }),
+      /simulated_crash_before_finalize/,
+    );
+    assert.equal(releases.prepareCalls, 1);
+    assert.equal(releases.activateCalls, 0);
+
+    new JsonLifecycleStore(tmp.file).transact((state) => {
+      const pending = state.projects["project-1"].pending_external_operation;
+      pending.request_transition = "release_activate";
+      pending.transition = "release_activate";
+      pending.ready_release_id = "release-attacker-selected";
+      pending.provider_claim = null;
+      return { ok: true };
+    });
+
+    const result = await normal.executeHumanTransition({
+      transition: "release_prepare",
+      request,
+    });
+    assert.deepEqual(result, {
+      ok: false,
+      error_code: "pending_transition_mismatch",
+      pending_recovery_required: true,
+    });
+    assert.equal(releases.activateCalls, 0);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+
+test("missing provider_claim fails closed before an exact release retry can re-enter the provider", async () => {
+  const tmp = tempStore();
+  try {
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const normal = createService(tmp.file, workspace, releases);
+    assert.equal(normal.createProject({
+      project_id: "project-1",
+      initial_workspace_digest: DIGEST_A,
+    }).ok, true);
+    assert.equal(normal.submitReview({
+      project_id: "project-1",
+      operation_id: "operation-1",
+      expected_workspace_digest: DIGEST_A,
+    }).ok, true);
+    assert.equal((await normal.executeHumanTransition({
+      transition: "accept",
+      request: humanRequest(),
+    })).ok, true);
+
+    const request = humanRequest({
+      transition: "release_prepare",
+      idempotency_key: "missing-provider-claim",
+      evidence: { authorization_id: "approval-missing-provider-claim" },
+    });
+    const crashing = createService(tmp.file, workspace, releases, {
+      afterExternalAction: async ({ transition }) => {
+        if (transition === "release_prepare") throw new Error("simulated_crash_missing_provider_claim");
+      },
+    });
+    await assert.rejects(
+      () => crashing.executeHumanTransition({ transition: "release_prepare", request }),
+      /simulated_crash_missing_provider_claim/,
+    );
+    assert.equal(releases.prepareCalls, 1);
+
+    new JsonLifecycleStore(tmp.file).transact((state) => {
+      delete state.projects["project-1"].pending_external_operation.provider_claim;
+      return { ok: true };
+    });
+
+    const result = await normal.executeHumanTransition({
+      transition: "release_prepare",
+      request,
+    });
+    assert.deepEqual(result, { ok: false, error_code: "lifecycle_state_invalid" });
+    assert.equal(releases.prepareCalls, 1);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+
+test("lifecycle directory durability retry re-flushes an ancestor left behind by the failed attempt", () => {
+  const tmp = tempStore();
+  const originalOpen = fs.openSync;
+  const nestedFile = path.join(tmp.dir, "nested", "deeper", "state.json");
+  let failOnce = true;
+  let retryAncestorOpenCount = 0;
+  try {
+    fs.openSync = (target, flags, ...rest) => {
+      if (
+        typeof target === "string"
+        && path.resolve(target) === path.resolve(tmp.dir)
+        && (flags === "r+" || flags === "r")
+      ) {
+        if (failOnce) {
+          failOnce = false;
+          const error = new Error("simulated-ancestor-directory-flush-failure");
+          error.code = "EIO";
+          throw error;
+        }
+        retryAncestorOpenCount += 1;
+      }
+      return originalOpen(target, flags, ...rest);
+    };
+    const workspace = createWorkspaceAuthority();
+    const releases = createReleaseAuthority();
+    workspace.setDigest("project-1", DIGEST_A);
+    const store = new JsonLifecycleStore(nestedFile);
+    const service = new StaticLifecycleService({
+      store,
+      workspaceAuthority: workspace,
+      releaseAuthority: releases,
+      verifyAuthorizationEvidence: async () => true,
+    });
+    assert.throws(
+      () => service.createProject({
+        project_id: "project-1",
+        initial_workspace_digest: DIGEST_A,
+      }),
+      /lifecycle_directory_sync_failed/,
+    );
+    assert.equal(fs.existsSync(path.join(tmp.dir, "nested")), true);
+
+    const retried = service.createProject({
+      project_id: "project-1",
+      initial_workspace_digest: DIGEST_A,
+    });
+    assert.equal(retried.ok, true);
+    assert.ok(retryAncestorOpenCount >= 1);
+  } finally {
+    fs.openSync = originalOpen;
+    tmp.cleanup();
+  }
+});
+
+
+test("pre-release schema v1 store fails explicitly instead of reinterpreting v1 digests as v2", () => {
+  const tmp = tempStore();
+  try {
+    const legacy = {
+      schema_version: 1,
+      projects: {
+        "project-1": {
+          project_id: "project-1",
+          project_type: "static_web",
+          workflow_state: "working",
+          current_workspace_digest: DIGEST_A,
+          accepted_workspace_digest: null,
+          accepted_snapshot_id: null,
+          active_operation_id: null,
+          active_operation_revision: null,
+          operation_revision_counter: "0",
+          operation_revision_high_watermark: "0",
+          ready_release_id: null,
+          active_release_id: null,
+          consumed_authorization_ids: [],
+          idempotency_results: {},
+          pending_external_operation: null,
+        },
+      },
+    };
+    fs.writeFileSync(tmp.file, JSON.stringify(legacy, null, 2) + "\n", "utf8");
+    const store = new JsonLifecycleStore(tmp.file);
+    assert.throws(
+      () => store.read(),
+      (error) => (
+        error?.code === "LIFECYCLE_STORE_MIGRATION_REQUIRED"
+        && error?.message === "lifecycle_store_migration_required"
+      ),
+    );
+    assert.equal(JSON.parse(fs.readFileSync(tmp.file, "utf8")).schema_version, 1);
   } finally {
     tmp.cleanup();
   }

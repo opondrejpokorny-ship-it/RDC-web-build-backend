@@ -4,19 +4,25 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const DEFAULT_STALE_LOCK_MS = 30_000;
 const LOCK_ACQUIRE_ATTEMPTS = 4;
-const CURRENT_PROCESS_START_IDENTITY = `self:${process.pid}:${Math.round(Date.now() - process.uptime() * 1000)}`;
 
 function initialState() {
   return {
     schema_version: SCHEMA_VERSION,
     projects: {},
+    prepared_changes: {},
+    prepared_change_idempotency: {},
   };
 }
 
 function validateState(state) {
+  if (state?.schema_version === 1) {
+    const migration = new Error("lifecycle_store_migration_required");
+    migration.code = "LIFECYCLE_STORE_MIGRATION_REQUIRED";
+    throw migration;
+  }
   if (
     !state
     || typeof state !== "object"
@@ -24,10 +30,81 @@ function validateState(state) {
     || !state.projects
     || typeof state.projects !== "object"
     || Array.isArray(state.projects)
+    || !state.prepared_changes
+    || typeof state.prepared_changes !== "object"
+    || Array.isArray(state.prepared_changes)
+    || !state.prepared_change_idempotency
+    || typeof state.prepared_change_idempotency !== "object"
+    || Array.isArray(state.prepared_change_idempotency)
   ) {
     throw new Error("lifecycle_store_invalid");
   }
   return state;
+}
+
+function trySyncDirectoryDurably(directoryPath) {
+  let fd;
+  try {
+    fd = fs.openSync(directoryPath, process.platform === "win32" ? "r+" : "r");
+    fs.fsyncSync(fd);
+    return true;
+  } catch (error) {
+    if (
+      process.platform === "win32"
+      && (error?.code === "EPERM" || error?.code === "EACCES")
+    ) {
+      return false;
+    }
+    const durable = new Error("lifecycle_directory_sync_failed");
+    durable.code = "LIFECYCLE_DIRECTORY_SYNC_FAILED";
+    durable.cause = error;
+    throw durable;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function syncDirectoryDurably(directoryPath) {
+  if (!trySyncDirectoryDurably(directoryPath)) {
+    const durable = new Error("lifecycle_directory_sync_unsupported");
+    durable.code = "LIFECYCLE_DIRECTORY_SYNC_UNSUPPORTED";
+    throw durable;
+  }
+}
+
+function ensureDirectoryDurably(directoryPath) {
+  const resolved = path.resolve(directoryPath);
+  const parsed = path.parse(resolved);
+  let current = parsed.root;
+  let durabilityStarted = false;
+  const relative = path.relative(parsed.root, resolved);
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    const next = path.join(current, part);
+    const existed = fs.existsSync(next);
+    if (!existed) {
+      try {
+        fs.mkdirSync(next);
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+      }
+    }
+    const stat = fs.lstatSync(next);
+    if (!stat.isDirectory()) throw new Error("lifecycle_directory_invalid");
+    if (!durabilityStarted) {
+      const supported = trySyncDirectoryDurably(current);
+      if (supported) {
+        durabilityStarted = true;
+      } else if (!existed) {
+        throw new Error("lifecycle_directory_sync_unsupported");
+      }
+    } else {
+      syncDirectoryDurably(current);
+    }
+    current = next;
+  }
+  return resolved;
 }
 
 function processIsAlive(pid) {
@@ -81,13 +158,23 @@ function windowsProcessStartIdentity(pid) {
   }
 }
 
+let cachedCurrentProcessStartIdentity;
+
 export function defaultProcessStartIdentity(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  if (pid === process.pid) return CURRENT_PROCESS_START_IDENTITY;
   if (!processIsAlive(pid)) return null;
-  if (process.platform === "linux") return linuxProcessStartIdentity(pid);
-  if (process.platform === "win32") return windowsProcessStartIdentity(pid);
-  return null;
+  const readIdentity = () => {
+    if (process.platform === "linux") return linuxProcessStartIdentity(pid);
+    if (process.platform === "win32") return windowsProcessStartIdentity(pid);
+    return null;
+  };
+  if (pid === process.pid) {
+    if (cachedCurrentProcessStartIdentity === undefined) {
+      cachedCurrentProcessStartIdentity = readIdentity();
+    }
+    return cachedCurrentProcessStartIdentity;
+  }
+  return readIdentity();
 }
 
 function parseOwnerMetadata(raw) {
@@ -141,7 +228,7 @@ export class JsonLifecycleStore {
   }
 
   ensureDirectory() {
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+    ensureDirectoryDurably(path.dirname(this.filePath));
   }
 
   initializeUnlocked() {
@@ -283,7 +370,12 @@ export class JsonLifecycleStore {
 
     for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt += 1) {
       const ownerId = crypto.randomUUID();
-      const processStartIdentity = this.processStartIdentity(process.pid) || CURRENT_PROCESS_START_IDENTITY;
+      const processStartIdentity = this.processStartIdentity(process.pid);
+      if (!processStartIdentity) {
+        const unavailable = new Error("lifecycle_process_identity_unavailable");
+        unavailable.code = "LIFECYCLE_PROCESS_IDENTITY_UNAVAILABLE";
+        throw unavailable;
+      }
       const metadata = {
         owner_id: ownerId,
         pid: process.pid,
@@ -369,6 +461,7 @@ export class JsonLifecycleStore {
       fs.closeSync(fd);
       fd = undefined;
       fs.renameSync(tempPath, this.filePath);
+      syncDirectoryDurably(path.dirname(this.filePath));
     } finally {
       if (fd !== undefined) {
         try { fs.closeSync(fd); } catch {}

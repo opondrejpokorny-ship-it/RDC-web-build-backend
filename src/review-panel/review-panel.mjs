@@ -362,7 +362,7 @@ export function createReviewSession({
     fail("review_external_transition_pending");
   }
 
-  const actions = [...allowedActions(project.workflow_state)];
+  let actions = [...allowedActions(project.workflow_state)];
   requireOperationBinding(project, actions);
   const validation = validateStaticWorkspace({
     workspace: workspaceAuthority,
@@ -370,7 +370,10 @@ export function createReviewSession({
     expected_workspace_digest: digest,
     read_view: readView,
   });
-  if (validation.ok !== true) fail("static_validation_failed");
+  if (validation.ok !== true) {
+    if (!actions.includes("reject")) fail("static_validation_failed");
+    actions = actions.filter((action) => action === "reject");
+  }
   const development = validateDevelopmentPreview(development_preview, project, digest);
   const published = validatePublishedPreview(
     published_preview,
@@ -439,7 +442,7 @@ function reviewSessionExpired(internals) {
   }
 }
 
-function actionWorkspaceFailure(internals, state) {
+function actionWorkspaceFailure(internals, state, action) {
   let readView;
   try {
     readView = internals.workspaceAuthority.captureReadView(state.project_id, {
@@ -448,6 +451,8 @@ function actionWorkspaceFailure(internals, state) {
   } catch {
     return "review_session_stale";
   }
+
+  if (action === "reject") return null;
 
   try {
     const validation = validateStaticWorkspace({
@@ -518,7 +523,7 @@ async function executeSessionAction(session, action) {
       ) {
         return { status: 409, body: { error_code: "review_session_stale" } };
       }
-      const workspaceFailure = actionWorkspaceFailure(internals, state);
+      const workspaceFailure = actionWorkspaceFailure(internals, state, action);
       if (workspaceFailure) {
         return { status: 409, body: { error_code: workspaceFailure } };
       }

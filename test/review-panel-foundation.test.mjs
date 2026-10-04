@@ -1102,7 +1102,7 @@ test("approval authority receives exact bindings for every gated panel action", 
   }
 });
 
-test("review session fails closed when current static validation fails", () => {
+test("review session exposes only Reject when current static validation fails", () => {
   const ctx = setupProject();
   try {
     const changed = ctx.workspace.applyChange("site-1", {
@@ -1112,13 +1112,15 @@ test("review session fails closed when current static validation fails", () => {
     ctx.lifecycle.store.transact((state) => {
       state.projects["site-1"].current_workspace_digest = changed.workspace_digest;
     });
-    assert.throws(() => createReviewSession({
+    const session = createReviewSession({
       lifecycleService: ctx.lifecycle,
       workspaceAuthority: ctx.workspace,
       approvalAuthority: createApprovalAuthority(),
       project_id: "site-1",
       now: () => NOW,
-    }), /static_validation_failed/);
+    });
+    assert.equal(session.state.validation.ok, false);
+    assert.deepEqual(session.state.allowed_actions, ["reject"]);
   } finally {
     ctx.tmp.cleanup();
   }
@@ -1367,6 +1369,73 @@ test("approval that returns after session expiry cannot execute lifecycle", asyn
     });
     assert.equal(retry.status, 410);
     assert.equal(baseApproval.calls.length, 1);
+  } finally {
+    if (panel) await panel.close();
+    ctx.tmp.cleanup();
+  }
+});
+
+
+test("invalid review candidate remains rejectable and restores accepted baseline without release side effects", async () => {
+  const ctx = setupProject();
+  let panel;
+  try {
+    const approvalAuthority = createApprovalAuthority();
+
+    const acceptSession = createReviewSession({
+      lifecycleService: ctx.lifecycle,
+      workspaceAuthority: ctx.workspace,
+      approvalAuthority,
+      project_id: "site-1",
+      development_preview: null,
+      published_preview: null,
+      now: () => NOW,
+    });
+    const acceptPanel = await startReviewPanelServer({ session: acceptSession });
+    assert.equal((await jsonRequest(acceptPanel.action_url, {
+      method: "POST",
+      body: { action: "accept", csrf_token: acceptSession.csrf_token },
+    })).status, 200);
+    await acceptPanel.close();
+
+    assert.equal(ctx.lifecycle.beginChange({
+      project_id: "site-1",
+      operation_id: "op-invalid-review",
+    }).ok, true);
+    const changed = ctx.workspace.applyChange("site-1", {
+      expected_workspace_digest: ctx.digest,
+      operations: [{ type: "delete", path: "index.html" }],
+    });
+    assert.equal(ctx.lifecycle.submitReview({
+      project_id: "site-1",
+      operation_id: "op-invalid-review",
+      expected_workspace_digest: changed.workspace_digest,
+    }).ok, true);
+
+    const rejectSession = createReviewSession({
+      lifecycleService: ctx.lifecycle,
+      workspaceAuthority: ctx.workspace,
+      approvalAuthority,
+      project_id: "site-1",
+      development_preview: null,
+      published_preview: null,
+      now: () => NOW,
+    });
+    assert.equal(rejectSession.state.validation.ok, false);
+    assert.deepEqual(rejectSession.state.allowed_actions, ["reject"]);
+
+    panel = await startReviewPanelServer({ session: rejectSession });
+    const response = await jsonRequest(panel.action_url, {
+      method: "POST",
+      body: { action: "reject", csrf_token: rejectSession.csrf_token },
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.transition, "reject");
+    assert.equal(result.state.workflow_state, "working");
+    assert.equal(ctx.workspace.computeDigest("site-1"), ctx.digest);
+    assert.equal(ctx.releaseAuthority.calls.prepare, 0);
+    assert.equal(ctx.releaseAuthority.calls.activate, 0);
   } finally {
     if (panel) await panel.close();
     ctx.tmp.cleanup();
