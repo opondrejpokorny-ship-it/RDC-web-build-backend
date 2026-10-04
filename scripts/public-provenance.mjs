@@ -98,7 +98,10 @@ export function listPublicCandidates(root) {
     seen.add(candidate.relativePath);
     candidates.push(candidate);
   }
-  return Object.freeze(candidates.sort((a, b) => a.relativePath.localeCompare(b.relativePath)));
+  return Object.freeze(candidates.sort((a, b) => Buffer.compare(
+    Buffer.from(a.relativePath, "utf8"),
+    Buffer.from(b.relativePath, "utf8"),
+  )));
 }
 
 export function listPublicCandidateFiles(root) {

@@ -6,12 +6,13 @@
   "private_source_copied": false,
   "third_party_source_copied": false,
   "reuse_requires_explicit_rights": true,
-  "review_evidence_id": "rdc-website-studio-media-library-integration-2026-09-28",
+  "review_evidence_id": "rdc-website-studio-static-web-provenance-cross-platform-final-terra-claude-2026-10-04",
   "review_methods": [
     "semantic_diff_review",
     "codex_terra_p0_p1_review",
+    "claude_sonnet_p0_p1_review",
     "public_safety_scan"
   ],
-  "tree_sha256": "sha256:8c7aed6590a7142a552e2d85eebfaf121c17f25549e69c859ed7b2625e8645aa",
-  "file_count": 35
+  "tree_sha256": "sha256:1d31e44e870f3f9e559f7f0f4f3afb5a50f3782f80d6b47e79fec4ea11b7875a",
+  "file_count": 38
 }

@@ -8,6 +8,7 @@ import {
   ATTESTATION_PATH,
   computePublicSourceEvidence,
   decodeGitPathBytes,
+  listPublicCandidateFiles,
   listUnstagedTrackedFiles,
   verifyPublicSourceAttestation,
 } from "../scripts/public-provenance.mjs";
@@ -45,6 +46,27 @@ test("public source evidence is bound to staged Git bytes, not hidden working-tr
     assert.notEqual(restaged.tree_sha256, staged.tree_sha256);
     assert.deepEqual(listUnstagedTrackedFiles(root), []);
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("public candidate ordering is canonical UTF-8 byte order and ignores locale collation", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rdc-web-provenance-order-"));
+  const originalLocaleCompare = String.prototype.localeCompare;
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: root });
+    fs.mkdirSync(path.join(root, "docs"));
+    fs.writeFileSync(path.join(root, "README.md"), "readme");
+    fs.writeFileSync(path.join(root, "docs", "file.md"), "docs");
+    execFileSync("git", ["add", "--", "README.md", "docs/file.md"], { cwd: root });
+
+    String.prototype.localeCompare = function hostileLocaleCompare(other) {
+      return -Buffer.compare(Buffer.from(String(this), "utf8"), Buffer.from(String(other), "utf8"));
+    };
+
+    assert.deepEqual(listPublicCandidateFiles(root), ["README.md", "docs/file.md"]);
+  } finally {
+    String.prototype.localeCompare = originalLocaleCompare;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
